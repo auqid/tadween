@@ -33,6 +33,7 @@ class Source(threading.Thread):
         self.error = None
         self.log_tail = ""
         self.speaking = False
+        self.heard = False  # any speech yet? Silent call audio means the mic is hearing everyone
         self.raw = open(session.dir / f"{name}.pcm", "wb")
 
     def run(self):
@@ -98,10 +99,11 @@ class Source(threading.Thread):
         self.raw.write(audio.to_pcm16(x))
         self.samples += len(x)
         for start, utterance in self.vad.accept(x):
+            self.heard = True
             self.session.heard(self.name, start + self.skipped / SR, utterance)
         if self.vad.speaking() != self.speaking:
             self.speaking = not self.speaking
-            events.emit("live_activity", source=self.name, speaking=self.speaking)
+            events.emit("live_activity", source=self.name, speaking=self.speaking, heard=self.heard)
 
 
 class LiveSession:
@@ -238,7 +240,7 @@ class LiveSession:
                 "stopping": self.stopping,
                 "lines": [_public(line) for line in self.lines if not line.get("removed")],
                 "speakers": self.speakers,
-                "sources": [{"name": s.name, "ready": s.ready, "error": s.error, "speaking": s.speaking}
+                "sources": [{"name": s.name, "ready": s.ready, "error": s.error, "speaking": s.speaking, "heard": s.heard}
                             for s in self.sources]}
 
     def stop(self):

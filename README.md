@@ -82,6 +82,7 @@ Delete a transcript in the app, or delete the folder, to remove it completely.
 
 - **Speaker separation depends on the audio.** One phone recording a room is the hardest case. Live capture of the call audio is much cleaner. If Tadween splits one person into two, merge them. If it lumps people together, set the number of people.
 - **Live lines appear in bursts.** Each line shows up a moment after a person pauses, not word by word.
+- **Live mode assumes your mic is only you.** If the call audio stays silent (people in the room, or a call on another device), the live view labels everything your mic hears as you and says so. The final transcript then tells the voices on your mic apart, as for a recording.
 - **Live text and labels are a draft.** After you press Stop, the whole call is transcribed again for the final version. With the Neural Engine this takes about a tenth of the call's length.
 - **Settings default to English.** For other languages, change the language in Settings.
 

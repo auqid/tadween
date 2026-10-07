@@ -277,6 +277,7 @@ table.list button { height: 28px; padding: 0 9px; font-size: 13px; }
 
 .banner { display: flex; align-items: center; gap: 14px; margin-top: 16px; padding: 12px 14px; border-radius: 9px; background: var(--wash); font-size: 13.5px; }
 .banner.error { background: color-mix(in srgb, var(--red) 9%, var(--paper)); }
+.banner.notice { display: block; margin-top: 12px; font-size: 13px; line-height: 1.5; color: var(--ink-2); }
 .banner.error b { font-weight: 600; }
 .progress { flex: 1; display: grid; gap: 8px; }
 .progress-top { display: flex; justify-content: space-between; gap: 12px; }

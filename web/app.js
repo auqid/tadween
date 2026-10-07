@@ -161,6 +161,8 @@ function tickClocks() {
   $("#live-time").textContent = since;
   const node = $("#elapsed");
   if (node && live) node.textContent = since;
+  const notice = $("#live-notice"), content = live ? liveNotice() : null;
+  if (notice && notice.childElementCount !== (content ? 1 : 0)) notice.replaceChildren(...(content ? [content] : []));
 }
 
 function markNav(page) {
@@ -798,9 +800,22 @@ function renderLive() {
         el("div", { class: "live-head" }, el("h1", {}, L.title),
           el("span", { class: "recording", id: "elapsed", title: "Recording time" }, fmt((Date.now() / 1000) - L.started)), stop),
         el("div", { class: "sources", id: "sources" }, sourcesEls()),
+        el("div", { id: "live-notice" }, liveNotice()),
         el("div", { id: "speakers" }, liveSpeakersEl()))),
     el("div", { id: "turns-scroll", class: "scroll" }, el("div", { id: "turns", class: "col" }, liveLinesEls())));
   scrollLiveToEnd(true);
+}
+
+/** Call audio silent while the mic hears speech: say why everyone shows as you, and what happens next. */
+function liveNotice() {
+  const src = state.live.sources || [];
+  const call = src.find((s) => s.name === "system"), mic = src.find((s) => s.name === "mic");
+  const quiet = state.live.running && call?.ready && !call.heard && !call.error && mic?.heard
+    && Date.now() / 1000 - state.live.started > 20;
+  return quiet ? el("p", { class: "banner notice" },
+    "The call audio is silent, so everyone your mic hears is shown as you for now. In a meeting with people in the room, "
+    + "Tadween tells the voices apart when you press Stop. On a call on this Mac, check that its sound plays on this Mac, "
+    + "and that the app running Tadween is allowed in System Settings › Privacy & Security › Screen & System Audio Recording.") : null;
 }
 
 function sourcesEls() {
@@ -1047,7 +1062,7 @@ const handlers = {
   },
   live_remove: (m) => { if (state.live.running) { state.live.lines = state.live.lines.filter((x) => x.index !== m.index); refreshLive(); } },
   live_speakers: (m) => { if (state.live.running) { state.live.speakers = m.speakers; refreshLive(); } },
-  live_activity: (m) => { const s = (state.live.sources || []).find((x) => x.name === m.source); if (s) { s.speaking = m.speaking; s.ready = true; $("#sources")?.replaceChildren(...sourcesEls()); } },
+  live_activity: (m) => { const s = (state.live.sources || []).find((x) => x.name === m.source); if (s) { s.speaking = m.speaking; s.heard = m.heard ?? s.heard; s.ready = true; $("#sources")?.replaceChildren(...sourcesEls()); } },
   live_status: (m) => { const s = (state.live.sources || []).find((x) => x.name === m.source); if (s) { s.ready = m.ready; $("#sources")?.replaceChildren(...sourcesEls()); } },
   live_error: (m) => {
     const s = (state.live.sources || []).find((x) => x.name === m.source);

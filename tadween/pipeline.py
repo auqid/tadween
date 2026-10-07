@@ -291,9 +291,13 @@ def _analyse_live(t, d, work, settings, progress):
         found[name] = (x, vad.speech_regions(x, progress=lambda f, lab=TRACKS[name]: progress(f"Finding speech in {lab}", f)))
     if not t.get("duration"):  # a call cut short by a crash never got its length
         store.update(t["id"], duration=round(max(len(x) for x, _ in found.values()) / config.SAMPLE_RATE, 2))
+    # Normally the call audio holds everyone else and the mic is you. With no speech in the call audio (people
+    # in the room, a call on another device), the mic heard everyone: group its voices like a recording's.
+    call_speech = bool(found.get("system", (None, []))[1])
+    voice_track = "system" if call_speech else "mic" if "mic" in found else None
     wins, voices = [], None
-    if "system" in found:
-        x, regions = found["system"]
+    if voice_track:
+        x, regions = found[voice_track]
         wins = speakers.make_windows(regions)
         voices = Background(speakers.embed_windows, x, wins)  # CPU work, runs while Whisper transcribes
     segs = {}
@@ -304,11 +308,14 @@ def _analyse_live(t, d, work, settings, progress):
     E = voices.result() if voices else np.zeros((0, 1), np.float32)
     if playable:
         playable.result()
-    call_segs = segs.get("system", [])
-    mic_segs = [{**s, "fixed": "ME"} for s in _without_echo(segs.get("mic", []), call_segs)]
+    if call_speech:
+        call_segs = segs.get("system", [])
+        final = call_segs + [{**s, "fixed": "ME"} for s in _without_echo(segs.get("mic", []), call_segs)]
+    else:
+        final = segs.get("mic", [])
     np.save(d / "embeddings.npy", E)
     config.write_json(d / "windows.json", wins)
-    config.write_json(d / "segments.json", call_segs + mic_segs)
+    config.write_json(d / "segments.json", final)
 
 
 def rebuild(t, num_speakers=None, settings=None):
