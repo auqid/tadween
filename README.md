@@ -56,6 +56,33 @@ cd tadween
 
 You need [Homebrew](https://brew.sh) and the Xcode Command Line Tools (`xcode-select --install`). The Neural Engine build also needs `cmake`, which setup installs with Homebrew. macOS prepares the Neural Engine model the first time each program uses it (about two minutes); setup does that for you, and after a macOS update the first transcription or live call may take that long to start.
 
+### Models
+
+The models are not in this repository (about 2 GB in all). `./setup.sh` downloads them into `models/`, and its last step (`./whisper/build.sh`) adds the Neural Engine encoder. Both skip files that are already there, so if a download fails, just run `./setup.sh` again.
+
+| File in `models/` | What it does | Size | Source | License |
+|---|---|---|---|---|
+| `ggml-large-v3-turbo-q8_0.bin` | Whisper large-v3-turbo, 8-bit: speech to text | 874 MB | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | MIT |
+| `silero_vad.onnx` | Silero VAD: finds where people speak | 0.6 MB | [sherpa-onnx `asr-models`](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models) | MIT |
+| `nemo_en_titanet_large.onnx` | NVIDIA NeMo TitaNet-large: voiceprints | 101 MB | [sherpa-onnx `speaker-recongition-models`](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models) | CC BY 4.0 |
+| `ggml-large-v3-turbo-encoder.mlmodelc/` | Whisper's encoder for the Neural Engine (optional) | 1.2 GB | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | MIT |
+
+To download them by hand instead:
+
+```bash
+mkdir -p models && cd models
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q8_0.bin
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_large.onnx
+
+# Optional, for the Neural Engine:
+curl -LO https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-encoder.mlmodelc.zip
+unzip -q ggml-large-v3-turbo-encoder.mlmodelc.zip && rm -rf ggml-large-v3-turbo-encoder.mlmodelc.zip __MACOSX
+cd .. && ./whisper/build.sh
+```
+
+Keep the file names: Tadween looks for exactly these, and whisper.cpp finds the encoder by its name next to the Whisper model. The encoder is used only by the Core ML build of whisper.cpp, which `./whisper/build.sh` makes; it skips the download when the encoder is already in `models/`. (The release tag really is spelled "recongition".)
+
 **Live-call permissions.** The first time you start a live session, macOS asks for **Microphone** and **Screen & System Audio Recording** access. Both go to the app that launched Tadween, such as Terminal or VS Code. Allow both, then quit and reopen that app. Headphones give the cleanest result. Without them, Tadween drops mic lines that are just an echo of the call.
 
 ## Command line
