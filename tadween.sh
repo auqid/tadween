@@ -6,5 +6,5 @@ if [ ! -x "$DIR/.venv/bin/python" ]; then
   echo "Run $DIR/setup.sh first." >&2
   exit 1
 fi
-[ $# -eq 0 ] && set -- serve
+if [ $# -eq 0 ] || [[ $1 == -* ]]; then set -- serve "$@"; fi  # ./tadween.sh --port 8766 means serve
 PYTHONPATH="$DIR${PYTHONPATH:+:$PYTHONPATH}" exec "$DIR/.venv/bin/python" -m tadween "$@"

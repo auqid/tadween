@@ -20,8 +20,8 @@ def edit_text(tid, turn_id, text):
             turn["edited"] = True
         others = [x for x in t["turns"] if x["id"] != turn_id]
         found = vocab.suggestions(old, turn["text"])
-        for s in found:
-            s["count"] = len(vocab.occurrences(others, s["from"]))
+        for s in found:  # what "Fix all" would change: spots already spelt right don't count
+            s["count"] = sum(vocab.replace(x["text"], s["from"], s["to"])[1] for x in others)
     events.emit("transcript", id=tid)
     return {"turn": turn, "suggestions": found}
 
@@ -48,6 +48,38 @@ def replace_all(tid, frm, to, turn_ids=None, remember=False):
     return count
 
 
+def _voice(t, label):
+    """A speaker's voiceprint. One made by hand ("new") gets the average of the cached voice windows inside
+    their lines, minus any overlapping your mic in a live call (those windows hold the call audio, not them)."""
+    d = store.folder(t["id"])
+    cents = config.read_json(d / "centroids.json", {})
+    if label not in cents:
+        lines = [(x["start"], x["end"]) for x in t["turns"] if x["speaker"] == label]
+        mic = [(s["start"], s["end"]) for s in config.read_json(d / "segments.json", []) if s.get("fixed")]
+        pick = [i for i, (a, b) in enumerate(config.read_json(d / "windows.json", []))
+                if any(s <= a and b <= e for s, e in lines) and not any(a < e and s < b for s, e in mic)]
+        if not pick:
+            return None
+        cents[label] = speakers.unit(speakers.unit(np.load(d / "embeddings.npy")[pick]).mean(0)).tolist()
+        config.write_json(d / "centroids.json", cents)
+    return np.array(cents[label], np.float32)
+
+
+def _remember(pid, name, vec):
+    """Save a voice under a name -> person id."""
+    bank = speakers.VoiceBank()
+    v = speakers.unit(vec)
+    own = next((p for p in bank.people if p["id"] == pid), None)
+    # A person saved from this voice alone (the same person in another call scores ~0.7) is replaced:
+    # kept beside the new name, its identical voiceprint would win in later calls.
+    if own and all(len(x) == len(v) and float(np.dot(x, v)) > 0.9 for x in own["samples"]):
+        bank.delete(pid)
+    pid = bank.enroll(name, vec)
+    if name not in bank.names():  # matched "ali" ignoring case: keep the new spelling
+        bank.rename(pid, name)
+    return pid
+
+
 def rename_speaker(tid, label, name, remember=True):
     """Name a voice. With remember, Tadween recognises it in future calls."""
     name = name.strip()
@@ -58,12 +90,18 @@ def rename_speaker(tid, label, name, remember=True):
         s.update(name=name, manual=True)
         if label == "ME":
             config.save_settings({"my_name": name})
-        elif remember:
-            cents = config.read_json(store.folder(tid) / "centroids.json", {})
-            if label in cents:
-                s["person"] = speakers.VoiceBank().enroll(name, np.array(cents[label], np.float32))
+        elif remember and (vec := _voice(t, label)) is not None:
+            s["person"] = _remember(s.get("person"), name, vec)
     events.emit("transcript", id=tid)
     return t["speakers"]
+
+
+def _forget_voice(tid, label):
+    """A speaker that's gone must not leave its voiceprint for a later speaker given the same label."""
+    f = store.folder(tid) / "centroids.json"
+    cents = config.read_json(f, {})
+    if cents.pop(label, None) is not None:
+        config.write_json(f, cents)
 
 
 def merge_speakers(tid, src, dst):
@@ -83,6 +121,8 @@ def merge_speakers(tid, src, dst):
         cents.pop(src, None)
         config.write_json(cents_file, cents)
         b["talk"] = round(a["talk"] + b["talk"], 1)
+        if (a.get("manual") or a.get("person")) and not (b.get("manual") or b.get("person")):  # dst has no name yet
+            b.update({k: a[k] for k in ("name", "person", "score", "manual", "remember") if k in a})
         del t["speakers"][src]
     events.emit("transcript", id=tid)
 
@@ -96,6 +136,7 @@ def set_turn_speaker(tid, turn_id, label):
             label = f"S{n}"
             t["speakers"][label] = {"label": label, "name": f"Speaker {n}", "person": None, "score": None,
                                     "manual": False, "talk": 0.0}
+            _forget_voice(tid, label)
         old = turn["speaker"]
         turn["speaker"] = label
         dur = turn["end"] - turn["start"]
@@ -104,6 +145,7 @@ def set_turn_speaker(tid, turn_id, label):
             t["speakers"][old]["talk"] = round(max(0.0, t["speakers"][old]["talk"] - dur), 1)
             if not any(x["speaker"] == old for x in t["turns"]):
                 del t["speakers"][old]
+                _forget_voice(tid, old)
     events.emit("transcript", id=tid)
 
 

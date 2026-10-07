@@ -13,9 +13,12 @@ brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
 brew list whisper-cpp >/dev/null 2>&1 || brew install whisper-cpp
 
 echo "==> Python packages"
-[ -d .venv ] || python3 -m venv .venv
-.venv/bin/pip install -q --upgrade pip
-.venv/bin/pip install -q -r requirements.txt
+if ! .venv/bin/python -c '' 2>/dev/null; then  # missing, or its Python was removed by a Homebrew upgrade
+  rm -rf .venv
+  python3 -m venv .venv
+fi
+.venv/bin/python -m pip install -q --upgrade pip
+.venv/bin/python -m pip install -q -r requirements.txt
 
 echo "==> Models (downloaded once)"
 mkdir -p models
@@ -35,6 +38,11 @@ if command -v swiftc >/dev/null 2>&1; then
   ./capture/build.sh
 else
   echo "    Skipped - install the Xcode Command Line Tools (xcode-select --install), then run capture/build.sh"
+fi
+
+echo "==> Faster transcription on the Neural Engine (Apple Silicon; 1.2 GB download, a few minutes once)"
+if ! ./whisper/build.sh; then
+  echo "    Skipped - Tadween will use Homebrew's whisper-cpp. Run ./whisper/build.sh later to try again."
 fi
 
 echo

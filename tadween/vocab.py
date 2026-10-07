@@ -4,6 +4,7 @@ import re
 import string
 import threading
 import time
+import unicodedata
 
 from . import config
 
@@ -11,38 +12,52 @@ PUNCT = string.punctuation + "“”‘’…"
 
 
 def pattern(phrase, case_sensitive=False):
-    """Whole-word match for a word or phrase, tolerant of extra whitespace."""
+    """Whole-word match for a word or phrase, tolerant of extra whitespace. A possessive 's still counts."""
     words = [re.escape(w) for w in phrase.split()]
     if not words:
         raise ValueError("empty phrase")
     body = r"\s+".join(words)
-    return re.compile(rf"(?<![\w']){body}(?![\w'])", 0 if case_sensitive else re.IGNORECASE)
+    return re.compile(rf"(?<![\w'’]){body}(?!\w)(?!['’](?![sS]\b)\w)", 0 if case_sensitive else re.IGNORECASE)
 
 
-def _keep_case(found, replacement):
+def _whole(m):
+    """re's \\w leaves out combining marks (Hindi vowel signs, Arabic harakat): a match touching one is in a word."""
+    s = m.string
+    return not any(unicodedata.category(c)[0] == "M" for c in s[m.start() - 1:m.start()] + s[m.end():m.end() + 1])
+
+
+def _keep_case(found, replacement, sentence_start):
     """A lowercase replacement keeps the capital of a sentence start."""
-    if replacement.islower() and found[:1].isupper():
+    if replacement.islower() and found[:1].isupper() and sentence_start:
         return replacement[:1].upper() + replacement[1:]
     return replacement
 
 
 def replace(text, phrase, replacement):
-    count = 0
+    rx, count = pattern(phrase), 0
+    if not rx.search(text):
+        return text, 0
+    # Spots that already read as the replacement stay ("Node.js" when fixing "Node" -> "Node.js").
+    done = [m.span() for m in re.finditer(r"\s+".join(map(re.escape, replacement.split())), text, re.IGNORECASE)]
 
     def sub(m):
         nonlocal count
-        new = _keep_case(m.group(0), replacement)
+        a, b = m.span()
+        if not _whole(m) or any(x <= a and b <= y and y - x > b - a for x, y in done):
+            return m.group(0)
+        before = text[:a].rstrip()
+        new = _keep_case(m.group(0), replacement, not before or before.endswith((".", "?", "!")))
         count += new != m.group(0)  # already-correct spellings don't count
         return new
 
-    return pattern(phrase).sub(sub, text), count
+    return rx.sub(sub, text), count
 
 
 def occurrences(turns, phrase, context=40):
     rx = pattern(phrase)
     hits = []
     for t in turns:
-        for m in rx.finditer(t["text"]):
+        for m in filter(_whole, rx.finditer(t["text"])):
             hits.append({"turn": t["id"], "start": t["start"], "match": m.group(0),
                          "before": t["text"][max(0, m.start() - context):m.start()],
                          "after": t["text"][m.end():m.end() + context]})

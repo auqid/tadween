@@ -26,9 +26,18 @@ def main():
         return
 
     from . import edits, pipeline, store
+    src = Path(args.file).expanduser()  # the shell leaves a quoted ~ alone
     pipeline.on_progress = _print_progress
-    tid = pipeline.import_file(args.file, queue_job=False)
-    pipeline.process(tid)
+    pipeline.hold_data_lock()  # so an app started meanwhile leaves this run alone
+    try:
+        tid = pipeline.import_file(src, queue_job=False)
+    except ValueError as e:
+        sys.exit(str(e))
+    try:
+        pipeline.process(tid)
+    except KeyboardInterrupt:
+        store.delete(tid)  # cancelled: nothing half-done for the app to resume later
+        raise
     if args.speakers:
         pipeline.regroup(tid, args.speakers)
     t = store.load(tid)
@@ -36,7 +45,6 @@ def main():
     if t["status"] != "ready":
         sys.exit(f"Failed: {t.get('error')}")
     _, _, text = edits.export(t, args.format)
-    src = Path(args.file)
     out = src.with_name(f"{src.stem} - transcript.{args.format}")
     out.write_text(text, encoding="utf-8")
     names = ", ".join(s["name"] for s in t["speakers"].values())

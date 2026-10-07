@@ -36,16 +36,21 @@ class Timeline:
     """
 
     def __init__(self, x, regions):
-        gap = np.zeros(int(GAP * SR), np.float32)
-        parts, self.spans = [], []  # spans: (packed_start, packed_end, original_start)
+        self.x = x
+        self.cuts, self.spans = [], []  # cuts: sample ranges of x; spans: (packed_start, packed_end, original_start)
         t = 0.0
         for a, b in regions:
-            chunk = x[int(a * SR):int(b * SR)]
-            parts += [chunk, gap]
-            self.spans.append((t, t + len(chunk) / SR, a))
-            t += len(chunk) / SR + GAP
-        self.audio = np.concatenate(parts) if parts else np.zeros(0, np.float32)
+            i = min(int(a * SR), len(x))
+            j = max(i, min(int(b * SR), len(x)))
+            self.cuts.append((i, j))
+            self.spans.append((t, t + (j - i) / SR, a))
+            t += (j - i) / SR + GAP
         self._starts = np.array([s[0] for s in self.spans]) if self.spans else np.zeros(1)
+
+    def write_wav(self, path):
+        """Write the packed audio piece by piece: a packed copy of a long call would cost hundreds of MB."""
+        gap = np.zeros(int(GAP * SR), np.float32)
+        audio.write_wav(path, (piece for i, j in self.cuts for piece in (self.x[i:j], gap)))
 
     def _span(self, t):
         return self.spans[max(0, int(np.searchsorted(self._starts, t, side="right")) - 1)]
@@ -59,10 +64,21 @@ class Timeline:
         return orig + (pe - ps)
 
 
+def decoding_args(settings):
+    """Whisper flags for the chosen speed. Measured on an M1 (8.4 min of speech): beam search 58 s on the GPU,
+    33 s with the Neural Engine encoder; greedy ("fast") 26 s on the Neural Engine, 44 s on the GPU."""
+    fast = settings.get("speed") == "fast"
+    args = ["-bs", "1"] if fast else []
+    if fast and not config.neural_engine():
+        return args  # flash attention (on by default) is the GPU's big speed-up, but rules out DTW
+    # DTW word timings line words up with voices more precisely; they need flash attention off.
+    return args + ["-dtw", config.WHISPER_DTW_PRESET, "-nfa"]
+
+
 def _run_cli(wav, out_base, prompt, settings, progress, fresh_context):
-    cmd = [config.tool("whisper-cli"), "-m", str(config.WHISPER_MODEL), "-f", str(wav),
+    cmd = [config.whisper_tool("whisper-cli"), "-m", str(config.WHISPER_MODEL), "-f", str(wav),
            "-l", settings["language"], "-t", str(settings["threads"]),
-           "-ojf", "-of", str(out_base), "-pp", "-dtw", config.WHISPER_DTW_PRESET, "-nfa"]
+           "-ojf", "-of", str(out_base), "-pp", *decoding_args(settings)]
     if prompt:
         cmd += ["--prompt", prompt, "--carry-initial-prompt"]
     if fresh_context:  # no carried-over text: the cure for repetition loops
@@ -74,9 +90,9 @@ def _run_cli(wav, out_base, prompt, settings, progress, fresh_context):
         if m and progress:
             progress(int(m.group(1)) / 100)
         tail = (tail + [line])[-15:]
-    if proc.wait() != 0:
-        raise RuntimeError("whisper-cli failed:\n" + "".join(tail))
     out = Path(f"{out_base}.json")
+    if proc.wait() != 0 or not out.exists():  # it exits 0 with no output when it can't read the audio
+        raise RuntimeError("whisper-cli failed:\n" + "".join(tail))
     result = json.loads(out.read_text(encoding="utf-8", errors="replace"))
     out.unlink(missing_ok=True)
     return result
@@ -119,11 +135,13 @@ def parse(result, timeline):
 
 
 def transcribe(timeline, workdir, prompt, settings, progress=None, fresh_context=False):
+    if not timeline.spans:  # no speech found: nothing for Whisper (and it can't read an empty file)
+        return []
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     name = uuid.uuid4().hex[:8]
     wav = workdir / f"{name}.wav"
-    audio.write_wav(wav, timeline.audio)
+    timeline.write_wav(wav)
     try:
         result = _run_cli(wav, workdir / name, prompt, settings, progress, fresh_context)
     finally:
@@ -153,6 +171,10 @@ def find_loops(segments):
             same = [i + k for k, s in enumerate(segments[i:i + 6]) if _norm(s["text"]) == words]
             if len(same) >= 3:
                 flagged.update(range(i, same[-1] + 1))
+        elif words:  # short lines ("Thank you.") recur in real talk too, so only four in a row count
+            same = [s for s in segments[i:i + 4] if _norm(s["text"]) == words]
+            if len(same) == 4:
+                flagged.update(range(i, i + 4))
         # Loops spread over several slightly different segments: look at a few neighbours together.
         j, text = i, ""
         while j < len(segments) and j < i + 8 and len(text) < 240:
@@ -216,16 +238,23 @@ def _free_port():
         return s.getsockname()[1]
 
 
+# Talks to our own whisper-server on 127.0.0.1, which urllib would otherwise send through any
+# http_proxy or macOS system proxy.
+_LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 class WhisperServer:
     """A long-running whisper-server so live snippets don't reload the model every time."""
 
     def __init__(self, settings):
         self.port = _free_port()
         self.proc = subprocess.Popen(
-            [config.tool("whisper-server"), "-m", str(config.WHISPER_MODEL), "--host", "127.0.0.1",
+            [config.whisper_tool("whisper-server"), "-m", str(config.WHISPER_MODEL), "--host", "127.0.0.1",
              "--port", str(self.port), "-l", settings["language"], "-t", str(min(4, settings["threads"]))],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.time() + 90
+        # The Neural Engine build compiles its encoder on a program's first start (about two minutes;
+        # whisper/build.sh does it ahead of time, but a macOS update can clear that cache).
+        deadline = time.time() + (300 if config.neural_engine() else 90)
         while True:
             if self.proc.poll() is not None:
                 raise RuntimeError("whisper-server exited during startup")
@@ -248,7 +277,7 @@ class WhisperServer:
                  f"Content-Type: audio/wav\r\n\r\n").encode() + audio.wav_bytes(x) + f"\r\n--{boundary}--\r\n".encode()
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}/inference", data=body,
                                      headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with _LOCAL.open(req, timeout=120) as resp:
             result = json.loads(resp.read().decode("utf-8", "replace"))
         segments = []
         for seg in result.get("segments", []):

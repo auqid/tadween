@@ -140,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
 @route("GET", "/api/state")
 def state(h):
     return {"settings": config.load_settings(), "live": live.status(),
-            "capture_helper": config.CAPTURE_BIN.exists()}
+            "capture_helper": config.CAPTURE_BIN.exists(), "neural_engine": config.neural_engine()}
 
 
 @route("GET", "/api/events")
@@ -364,11 +364,11 @@ def live_rename(h, label):
 
 def run(port=8765, open_browser=True):
     config.TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
-    pipeline.start()
     try:
         server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError:
         raise SystemExit(f"Port {port} is busy - is Tadween already running? Try --port {port + 1}.")
+    pipeline.start()  # only once the port is ours: a launch that can't run must not touch the running app's work
     server.daemon_threads = True
     url = f"http://127.0.0.1:{port}/"
     print(f"Tadween is running at {url}  (Ctrl+C to stop)")

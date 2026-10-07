@@ -11,5 +11,7 @@ data/
 
 # Build outputs
 capture/tadween-capture
+whisper/bin/
+whisper/src/
 
 .DS_Store
