@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tadween</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f766e'/%3E%3Cpath d='M9 20h14M9 15h14M9 10h9' stroke='white' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <a class="brand" href="#/"><span class="logo" aria-hidden="true"></span>Tadween</a>
+      <a class="btn primary block" href="#/live" id="live-link"><span class="rec"></span><span id="live-label">Start live transcription</span></a>
+      <label class="btn block">
+        <input type="file" id="file-input" accept="audio/*,video/*,.m4a,.mp3,.mp4,.wav,.mov,.webm,.ogg,.flac" hidden>
+        Transcribe a recording…
+      </label>
+      <nav>
+        <div class="nav-title">Transcripts</div>
+        <ul id="transcript-list"></ul>
+        <div class="nav-title">Library</div>
+        <a class="nav-link" href="#/vocabulary">Word fixes</a>
+        <a class="nav-link" href="#/people">Known voices</a>
+        <a class="nav-link" href="#/settings">Settings</a>
+      </nav>
+    </aside>
+    <main id="main">
+      <div id="view"></div>
+      <div id="player-bar" hidden></div>
+    </main>
+  </div>
+  <div id="drop-overlay" hidden><div>Drop a recording to transcribe it</div></div>
+  <div id="fix-button" hidden></div>
+  <div id="popover" hidden></div>
+  <div id="toast-area" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>
