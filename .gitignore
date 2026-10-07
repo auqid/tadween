@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded models (fetched by setup.sh)
+models/
+
+# Your recordings, transcripts and voiceprints never leave this machine
+data/
+
+# Build outputs
+capture/tadween-capture
+
+.DS_Store
