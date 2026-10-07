@@ -83,6 +83,26 @@ cd .. && ./whisper/build.sh
 
 Keep the file names: Tadween looks for exactly these, and whisper.cpp finds the encoder by its name next to the Whisper model. The encoder is used only by the Core ML build of whisper.cpp, which `./whisper/build.sh` makes; it skips the download when the encoder is already in `models/`. (The release tag really is spelled "recongition".)
 
+### Running faster on a more powerful Mac
+
+The numbers above come from a base M1 with 8 GB. On a newer or bigger Mac, in order of impact:
+
+1. **Use the Neural Engine build.** `./setup.sh` installs it, and *Settings → Neural Engine* should say *On*. Newer chips have much faster Neural Engines, so this gains even more there.
+2. **On a Pro, Max or Ultra chip, try the GPU too.** Those chips have many more GPU cores, and Whisper on the GPU may beat the Neural Engine. Time the same recording both ways, with the same *Transcription speed* setting, and keep whichever is faster:
+
+   ```bash
+   time ./tadween.sh transcribe "Team sync.m4a"                           # Neural Engine
+   time TADWEEN_NEURAL_ENGINE=0 ./tadween.sh transcribe "Team sync.m4a"   # GPU only
+   ```
+
+   To stay on the GPU, start Tadween with `TADWEEN_NEURAL_ENGINE=0 ./tadween.sh`, or delete `whisper/bin`. On the GPU, *Faster* also turns on flash attention, the GPU's biggest speed-up.
+3. **Choose Faster transcription** in Settings: about a quarter quicker. It drops most filler words and may word a few phrases differently.
+4. **Match CPU threads to your performance cores.** Voice recognition runs on the CPU while Whisper works. `sysctl -n hw.perflevel0.physicalcpu` shows how many you have (4 on an M1, more on Pro and Max chips). Enter that in *Settings → CPU threads*, then restart Tadween.
+5. **Leave enough memory free.** Transcribing a long call takes about 2 GB. With 16 GB or more this never matters; on 8 GB, quit memory-hungry apps first, or macOS starts swapping and everything slows down.
+6. **Keep it plugged in and cool.** Turn off Low Power Mode. A fanless MacBook Air slows down as it warms up during a long job; a MacBook Pro or desktop Mac keeps its speed.
+
+Intel Macs have no Neural Engine, so setup skips that step and transcription is slower; *Faster* helps most there.
+
 **Live-call permissions.** The first time you start a live session, macOS asks for **Microphone** and **Screen & System Audio Recording** access. Both go to the app that launched Tadween, such as Terminal or VS Code. Allow both, then quit and reopen that app. Headphones give the cleanest result. Without them, Tadween drops mic lines that are just an echo of the call.
 
 ## Command line

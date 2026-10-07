@@ -1007,11 +1007,13 @@ async function renderSettings() {
       setting("Transcription speed", "Faster decodes greedily: about a quarter quicker. It drops most filler words like “um” and may word a few phrases differently.", speed),
       el("div", { class: "setting" }, el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Neural Engine"),
         el("span", { class: "setting-help" }, state.neuralEngine
-          ? "On: Whisper's encoder runs on the Mac's Neural Engine, about 1.7× faster than the GPU."
-          : "Off. On Apple Silicon, run ./whisper/build.sh in the Tadween folder to transcribe about 1.7× faster.")),
+          ? "On: Whisper's encoder runs on the Mac's Neural Engine, about 1.7× faster than the GPU on an M1."
+          : state.neuralEngineInstalled
+            ? "Off: turned off with TADWEEN_NEURAL_ENGINE=0, so Whisper runs on the GPU."
+            : "Off. On Apple Silicon, run ./whisper/build.sh in the Tadween folder to transcribe about 1.7× faster.")),
         el("span", { class: `engine${state.neuralEngine ? " on" : ""}` }, state.neuralEngine ? "On" : "Off")),
       setting("Whisper style prompt", "A punctuated sentence Whisper imitates. Keep it short.", prompt),
-      setting("CPU threads", "How many processor threads transcription uses.", threads)),
+      setting("CPU threads", "For Whisper and voice recognition. Use your Mac's number of performance cores; restart Tadween after changing it.", threads)),
     el("h2", {}, "Voices"),
     el("div", { class: "group" },
       setting("Voice grouping", "Applies to new transcripts. To regroup an existing one, use Speakers in its header.", scale(sep, "More speakers", "Fewer speakers"), true),
@@ -1111,6 +1113,7 @@ setInterval(tickClocks, 1000);
     state.live = s.live;
     state.capture = s.capture_helper;
     state.neuralEngine = s.neural_engine;
+    state.neuralEngineInstalled = s.neural_engine_installed;
     connectEvents();
     await loadList();
     addEventListener("hashchange", route);

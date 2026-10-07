@@ -59,9 +59,14 @@ def tool(name):
     raise FileNotFoundError(f"{name} not found - run ./setup.sh")
 
 
-def neural_engine():
-    """Is the Core ML build installed? Whisper's encoder then runs on the Neural Engine (~1.7x faster on an M1)."""
+def neural_engine_installed():
     return (WHISPER_BIN / "whisper-cli").exists() and COREML_ENCODER.exists()
+
+
+def neural_engine():
+    """Use the Core ML build? Whisper's encoder then runs on the Neural Engine (~1.7x faster on an M1).
+    TADWEEN_NEURAL_ENGINE=0 turns it off, to compare with the GPU (big GPUs on Max/Ultra chips may win)."""
+    return os.environ.get("TADWEEN_NEURAL_ENGINE") != "0" and neural_engine_installed()
 
 
 def whisper_tool(name):

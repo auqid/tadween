@@ -140,7 +140,8 @@ class Handler(BaseHTTPRequestHandler):
 @route("GET", "/api/state")
 def state(h):
     return {"settings": config.load_settings(), "live": live.status(),
-            "capture_helper": config.CAPTURE_BIN.exists(), "neural_engine": config.neural_engine()}
+            "capture_helper": config.CAPTURE_BIN.exists(), "neural_engine": config.neural_engine(),
+            "neural_engine_installed": config.neural_engine_installed()}
 
 
 @route("GET", "/api/events")
