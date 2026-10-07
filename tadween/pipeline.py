@@ -1,5 +1,7 @@
 """Recording -> speaker-labelled transcript; also rebuilds it when voices are regrouped."""
+import difflib
 import queue
+import re
 import shutil
 import threading
 import time
@@ -94,7 +96,7 @@ def process(tid):
     progress = Progress(tid)
     try:
         if t.get("kind") == "live":
-            _analyse_live(d, progress)
+            _analyse_live(d, work, settings, progress)
         else:
             _analyse_file(t, d, work, settings, progress)
         progress("Putting names to voices", 1.0)
@@ -154,16 +156,49 @@ def _analyse_file(t, d, work, settings, progress):
     store.update(t["id"], repaired_loops=loops)
 
 
-def _analyse_live(d, progress):
-    """After a live call: proper voice grouping over the whole call audio (your mic needs none)."""
+TRACKS = {"system": "call audio", "mic": "your mic"}
+
+
+def _words(text):
+    return re.sub(r"[^a-z0-9' ]+", " ", text.lower()).split()
+
+
+def _without_echo(mic_segs, call_segs):
+    """Without headphones the mic also hears the call: drop mic lines the call audio already has."""
+    call_words = [w for s in call_segs for w in s["words"]]
+    kept = []
+    for seg in mic_segs:
+        nearby = " ".join(w["w"] for w in call_words if seg["start"] - 2 <= w["s"] <= seg["end"] + 2)
+        if difflib.SequenceMatcher(None, _words(seg["text"]), _words(nearby)).ratio() < 0.6:
+            kept.append(seg)
+    return kept
+
+
+def _analyse_live(d, work, settings, progress):
+    """After a live call: transcribe each track again with full context (live snippets are rougher),
+    then group the voices on the call audio. Your mic needs no grouping - it's you."""
+    voc, bank = vocab.Vocabulary(), speakers.VoiceBank()
+    prompt = asr.build_prompt(settings["initial_prompt"], voc.prompt_terms() + bank.names())
+    found = {}
+    for name, label in TRACKS.items():
+        if not (d / f"{name}.wav").exists():
+            continue
+        x = audio.read_wav(d / f"{name}.wav")
+        regions = vad.speech_regions(x, progress=lambda f, lab=label: progress(f"Finding speech in {lab}", f))
+        segs = asr.transcribe(asr.Timeline(x, regions), work, prompt, settings,
+                              progress=lambda f, lab=label: progress(f"Transcribing {lab}", f)) if regions else []
+        segs, _ = asr.repair_loops(segs, x, regions, work, prompt, settings)
+        found[name] = (x, regions, segs)
     wins, E = [], np.zeros((0, 1), np.float32)
-    if (d / "system.wav").exists():
-        x = audio.read_wav(d / "system.wav")
-        regions = vad.speech_regions(x, progress=lambda f: progress("Finding speech", f))
+    if "system" in found:
+        x, regions, _ = found["system"]
         wins = speakers.make_windows(regions)
         E = speakers.embed_windows(x, wins, progress=lambda f: progress("Recognising voices", f))
+    call_segs = found.get("system", (None, None, []))[2]
+    mic_segs = [{**s, "fixed": "ME"} for s in _without_echo(found.get("mic", (None, None, []))[2], call_segs)]
     np.save(d / "embeddings.npy", E)
     config.write_json(d / "windows.json", wins)
+    config.write_json(d / "segments.json", call_segs + mic_segs)
 
 
 def rebuild(t, num_speakers=None, settings=None):
