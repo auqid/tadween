@@ -3,9 +3,10 @@
 // Transcript text is untrusted (it comes from audio), so it is only ever inserted as text nodes.
 
 const $ = (sel, root = document) => root.querySelector(sel);
-const PALETTE = ["#2563eb", "#db2777", "#059669", "#d97706", "#7c3aed", "#0891b2", "#dc2626", "#65a30d", "#c026d3", "#64748b"];
-const ME_COLOR = "#0d9488";
-const state = { list: [], t: null, settings: {}, live: { running: false }, capture: true, query: "", follow: true, editing: null, stale: false, playingId: null };
+const SPEAKER_HUES = 8; // --s1 … --s8 in style.css; later speakers share a neutral grey rather than repeating a hue
+const RATES = [1, 1.25, 1.5, 1.75, 2];
+const state = { list: [], t: null, settings: {}, live: { running: false }, capture: true, query: "", follow: true, editing: null, stale: false, playingId: null, seeking: false, rate: 1 };
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
 // ---------- small helpers ----------
 
@@ -41,14 +42,34 @@ const fmt = (sec) => {
 };
 const fmtDur = (sec) => { const m = Math.round((sec || 0) / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`; };
 const fmtDate = (iso) => new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
-const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const plural = (n, word, many = `${word}s`) => `${n.toLocaleString()} ${n === 1 ? word : many}`;
 const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const isDefaultName = (name) => /^Speaker \d+$/.test(name);
 
 function color(label) {
-  if (label === "ME") return ME_COLOR;
-  const n = parseInt(String(label).slice(1), 10);
-  return PALETTE[((n || 1) - 1) % PALETTE.length];
+  if (label === "ME") return "var(--me)";
+  const n = parseInt(String(label).slice(1), 10) || 1;
+  return n <= SPEAKER_HUES ? `var(--s${n})` : "var(--s-other)";
+}
+
+// Static, trusted SVG markup only - never put transcript text in here.
+const ICONS = {
+  play: '<path d="M5 3.3v9.4a.6.6 0 0 0 .9.5l7.4-4.7a.6.6 0 0 0 0-1L5.9 2.8a.6.6 0 0 0-.9.5z"/>',
+  pause: '<rect x="4" y="3" width="2.8" height="10" rx=".8"/><rect x="9.2" y="3" width="2.8" height="10" rx=".8"/>',
+  back: '<path d="M3.2 6.2A5.3 5.3 0 1 1 2.7 9"/><path d="M2.8 2.9v3.4h3.4"/><text x="8.6" y="10.9" font-size="5.6" font-weight="700" text-anchor="middle" fill="currentColor" stroke="none" font-family="-apple-system, system-ui, sans-serif">5</text>',
+  search: '<circle cx="7" cy="7" r="4.3"/><path d="m10.2 10.2 3.3 3.3"/>',
+  upload: '<path d="M8 10.5V2.8M4.9 5.8 8 2.7l3.1 3.1M2.8 10.2v1.9c0 .7.6 1.3 1.3 1.3h7.8c.7 0 1.3-.6 1.3-1.3v-1.9"/>',
+  stop: '<rect x="2" y="2" width="12" height="12" rx="2"/>',
+  voice: '<path d="M3 6.5v3M6 4v8M9 5.5v5M12 7v2"/>',
+};
+const SOLID = new Set(["play", "pause", "stop"]);
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", `icon i-${name}${SOLID.has(name) ? " solid" : ""}`);
+  svg.innerHTML = ICONS[name];
+  return svg;
 }
 
 /** Split text into nodes, wrapping every match of the phrases in <tag class=cls>. */
@@ -102,24 +123,49 @@ async function loadList() {
   renderList();
 }
 
-function statusText(item) {
-  if (item.status === "live") return "● Live now";
-  if (item.status === "queued") return "Waiting to process…";
-  if (item.status === "processing") return item.progress?.stage || "Processing…";
-  if (item.status === "error") return "Failed - open to retry";
-  return `${fmtDate(item.created)} · ${fmtDur(item.duration)}`;
+function statusEls(item) {
+  if (item.status === "live") return el("span", { class: "sub live" }, el("span", { class: "rec" }), "Recording now");
+  if (item.status === "queued") return el("span", { class: "sub" }, el("span", {}, "Waiting to process…"));
+  if (item.status === "processing") {
+    return [el("span", { class: "sub" }, el("span", {}, item.progress?.stage || "Processing…")),
+      el("span", { class: "mini-bar" }, el("i", { style: `width:${Math.round((item.progress?.fraction || 0) * 100)}%` }))];
+  }
+  if (item.status === "error") return el("span", { class: "sub error" }, el("span", {}, "Failed. Open it to retry."));
+  return el("span", { class: "sub" }, el("span", {}, fmtDate(item.created)), el("span", { class: "num" }, fmtDur(item.duration)));
 }
 
 function renderList() {
   const items = state.list.map((item) => el("li", {},
-    el("a", { href: `#/t/${item.id}`, class: state.t?.id === item.id ? "active" : "" },
-      el("span", { class: "title" }, item.title),
-      el("span", { class: `sub${item.status === "live" ? " live" : ""}` }, statusText(item)))));
-  $("#transcript-list").replaceChildren(...(items.length ? items : [el("li", { class: "empty" }, "Nothing yet")]));
+    el("a", { href: `#/t/${item.id}`, class: state.t?.id === item.id ? "active" : "", "aria-current": state.t?.id === item.id ? "page" : null },
+      el("span", { class: "title" }, item.title), statusEls(item))));
+  $("#transcript-list").replaceChildren(...(items.length ? items : [el("li", { class: "empty" }, "No transcripts yet")]));
   const live = state.live.running;
   $("#live-link").classList.toggle("on", live);
-  $("#live-label").textContent = live ? "Live - recording now" : "Start live transcription";
+  $("#live-label").textContent = live ? "Recording" : "Start live transcription";
+  tickClocks();
 }
+
+function tickClocks() {
+  const live = state.live.running;
+  const since = live ? fmt(Date.now() / 1000 - state.live.started) : "";
+  $("#live-time").textContent = since;
+  const node = $("#elapsed");
+  if (node && live) node.textContent = since;
+}
+
+function markNav(page) {
+  document.querySelectorAll(".nav-link").forEach((a) => {
+    if (a.getAttribute("href") === `#/${page}`) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  });
+}
+
+function setNav(open) {
+  document.body.classList.toggle("nav-open", open);
+  $("#menu-button").setAttribute("aria-expanded", String(open));
+}
+$("#menu-button").addEventListener("click", () => setNav(!document.body.classList.contains("nav-open")));
+$("#scrim").addEventListener("click", () => setNav(false));
 
 // ---------- router ----------
 
@@ -127,7 +173,9 @@ function route() {
   closePopover();
   hideFixButton();
   const [, page, id] = (location.hash.slice(1) || "/").split("/");
-  if (page !== "t") { state.t = null; $("#player-bar").hidden = true; }
+  setNav(false);
+  markNav(page);
+  if (page !== "t") { state.t = null; $("#player-bar").hidden = true; $("#player-bar audio")?.pause(); }
   if (page === "t" && id) return openTranscript(id);
   renderList();
   if (page === "live") return renderLive();
@@ -137,18 +185,25 @@ function route() {
   renderHome();
 }
 
+const pageView = (...kids) => el("div", { class: "page" }, el("div", { class: "col" }, kids));
+
 function renderHome() {
-  view(el("div", { class: "page narrow" },
-    el("h1", {}, "Tadween"),
-    el("p", { class: "muted" }, "Private call transcripts with speaker names. Everything runs on this Mac - audio never leaves it."),
+  view(pageView(
+    el("h1", {}, "Transcribe a call"),
+    el("p", { class: "lede" }, "Add a recording, or transcribe a call live while it happens. Everything runs on this Mac, so audio never leaves it."),
     el("label", { class: "dropzone" },
-      el("strong", {}, "Drop a recording here, or click to choose one"),
-      "Zoom, Meet or Teams recordings, voice memos - m4a, mp3, mp4, wav, mov…",
-      el("input", { type: "file", hidden: true, accept: "audio/*,video/*", onchange: (e) => e.target.files[0] && upload(e.target.files[0]) })),
-    el("div", { class: "cards" },
-      el("div", { class: "card" }, el("b", {}, "Live calls"), "Start live transcription before a call. Your mic is you; the call audio is everyone else."),
-      el("div", { class: "card" }, el("b", {}, "Names that stick"), "Name a speaker once. Tadween remembers the voice and labels them in future calls."),
-      el("div", { class: "card" }, el("b", {}, "Fix once, fixed everywhere"), "Correct a word and Tadween offers to fix it everywhere - and in future transcripts."))));
+      icon("upload"),
+      el("strong", {}, "Drop a recording here, or choose a file"),
+      el("span", { class: "muted" }, "Zoom, Meet and Teams recordings or voice memos: m4a, mp3, mp4, wav or mov"),
+      el("input", { type: "file", class: "visually-hidden", accept: "audio/*,video/*,.m4a,.mp3,.mp4,.wav,.mov,.webm,.ogg,.flac",
+        onchange: (e) => { if (e.target.files[0]) upload(e.target.files[0]); e.target.value = ""; } })),
+    el("div", { class: "or-live" },
+      el("a", { class: "btn", href: "#/live" }, el("span", { class: "rec" }), "Start live transcription"),
+      el("span", { class: "muted" }, "Your mic is labelled as you. The call audio is everyone else.")),
+    el("dl", { class: "facts" },
+      el("div", {}, el("dt", {}, "Names that stick"), el("dd", {}, "Click a speaker in a transcript and type their name. Tadween remembers the voice and labels them in later calls.")),
+      el("div", {}, el("dt", {}, "Fix once"), el("dd", {}, "Correct a word and Tadween offers to fix every occurrence, and to fix it in future transcripts too.")),
+      el("div", {}, el("dt", {}, "Stays on this Mac"), el("dd", {}, "Speech recognition and voice matching run locally. Voices are stored as voiceprints, not audio.")))));
 }
 
 // ---------- transcript ----------
@@ -195,14 +250,15 @@ function renderTranscript(keepScroll = false) {
   const words = t.turns.reduce((n, x) => n + x.text.split(/\s+/).length, 0);
   view(
     el("div", { class: "header" },
-      el("div", { class: "row1" }, title,
-        ready ? el("button", { onclick: exportMenu }, "Export") : null,
-        t.status !== "live" && t.status !== "processing" ? el("button", { class: "ghost danger", title: "Delete", onclick: remove }, "Delete") : null),
-      el("div", { class: "meta-line" }, `${fmtDate(t.created)} · ${fmtDur(t.duration)}${ready ? ` · ${plural(words, "word")}` : ""}`),
-      statusEl(t),
-      ready || t.turns.length ? el("div", { id: "speakers" }, speakersEl(t)) : null,
-      ready ? toolbarEl(t) : null),
-    el("div", { id: "turns-scroll", class: "scroll" }, el("div", { id: "turns" }, turnsEls(t))));
+      el("div", { class: "col indent" },
+        el("div", { class: "row1" }, title,
+          ready ? el("button", { onclick: exportMenu }, "Export") : null,
+          t.status !== "live" && t.status !== "processing" ? el("button", { class: "ghost quiet-danger", onclick: remove }, "Delete") : null),
+        el("div", { class: "meta-line" }, el("span", {}, fmtDate(t.created)), el("span", {}, fmtDur(t.duration)), ready ? el("span", {}, plural(words, "word")) : null),
+        statusEl(t),
+        ready || t.turns.length ? el("div", { id: "speakers" }, speakersEl(t)) : null,
+        ready ? toolbarEl() : null)),
+    el("div", { id: "turns-scroll", class: "scroll" }, el("div", { id: "turns", class: "col" }, turnsEls(t))));
   $("#turns-scroll").scrollTop = top;
   renderPlayer(t);
 }
@@ -214,39 +270,51 @@ function statusEl(t) {
       el("button", { onclick: async () => { try { await api("POST", `/api/transcripts/${t.id}/retry`); await reloadTranscript(); } catch (e) { fail(e); } } }, "Retry"));
   }
   const p = t.progress || {};
+  const pct = Math.round((p.fraction || 0) * 100);
   return el("div", { class: "banner", id: "progress" },
-    el("span", { id: "progress-stage" }, t.status === "queued" ? "Waiting for the previous job…" : p.stage || "Starting…"),
-    el("div", { class: "bar" }, el("div", { id: "progress-fill", style: `width:${Math.round((p.fraction || 0) * 100)}%` })));
+    el("div", { class: "progress" },
+      el("div", { class: "progress-top" },
+        el("span", { id: "progress-stage" }, t.status === "queued" ? "Waiting for the previous job…" : p.stage || "Starting…"),
+        el("span", { class: "num", id: "progress-pct" }, `${pct}%`)),
+      el("div", { class: "bar" }, el("div", { id: "progress-fill", style: `width:${pct}%` }))));
 }
 
 function speakersEl(t) {
   const labels = Object.keys(t.speakers || {});
   const total = labels.reduce((sum, k) => sum + (t.speakers[k].talk || 0), 0) || 1;
   const ready = t.status === "ready";
-  return el("div", { class: "speakers" },
-    labels.map((k) => {
+  return [
+    el("div", { class: "speakers" }, labels.map((k) => {
       const s = t.speakers[k];
       return el("button", { class: "chip", style: `--c:${color(k)}`, disabled: !ready, onclick: (e) => speakerMenu(e.currentTarget, k) },
-        el("span", { class: "dot" }), s.name,
+        el("span", { class: "swatch" }), s.name,
         el("span", { class: "talk" }, `${Math.round((100 * (s.talk || 0)) / total)}%`),
-        s.person && !s.manual ? el("span", { class: "badge", title: `Recognised from a saved voice (${Math.round((s.score || 0) * 100)}% match). Click to correct.` }, "auto") : null);
-    }),
-    ready && labels.some((k) => isDefaultName(t.speakers[k].name))
-      ? el("span", { class: "hint" }, "Click a speaker to name them - their voice is remembered for next time.") : null);
+        s.person && !s.manual ? voiceMatchEl(s) : null);
+    })),
+    ready ? el("div", { class: "speakers-foot" },
+      labels.some((k) => isDefaultName(t.speakers[k].name))
+        ? el("span", { class: "hint" }, "Click a speaker to name them. Tadween remembers their voice for next time.") : null,
+      regroupEl(t)) : null,
+  ];
 }
 
-function toolbarEl(t) {
-  const count = el("span", { class: "muted small", id: "match-count" });
-  const search = el("input", { type: "search", placeholder: "Search this transcript", value: state.query,
-    oninput: (e) => { state.query = e.target.value; renderTurns(); } });
-  const regroupSel = el("select", { title: "How many people talk in this call? Tadween regroups the voices.", onchange: (e) => regroup(e.target.value) },
+const voiceMatchEl = (s) => el("span", { class: "voice-match", title: `Recognised from a saved voice${s.score ? ` (${Math.round(s.score * 100)}% match)` : ""}. Click to correct.` },
+  icon("voice"), el("span", { class: "visually-hidden" }, "recognised by voice"));
+
+function regroupEl(t) {
+  const sel = el("select", { title: "How many people talk in this call? Tadween regroups the voices.", onchange: (e) => regroup(e.target.value) },
     el("option", { value: "" }, "Auto"),
     Array.from({ length: 11 }, (_, i) => i + 2).map((k) => el("option", { value: k, selected: t.num_speakers === k }, String(k))));
-  return el("div", { class: "toolbar" }, search, count,
-    el("button", { class: "link", title: "Replace this word or phrase everywhere", onclick: (e) => state.query.trim() && openReplace(e.currentTarget, state.query.trim()) }, "Replace…"),
-    el("span", { class: "spacer" }),
-    el("label", {}, el("input", { type: "checkbox", checked: state.follow, onchange: (e) => { state.follow = e.target.checked; } }), "Follow audio"),
-    el("label", {}, "People", regroupSel));
+  return el("label", { class: "regroup" }, "Speakers", sel);
+}
+
+function toolbarEl() {
+  const count = el("span", { id: "match-count" });
+  const replace = el("button", { class: "link", hidden: !state.query.trim(), title: "Replace this word or phrase everywhere",
+    onclick: (e) => state.query.trim() && openReplace(e.currentTarget, state.query.trim()) }, "Replace…");
+  const search = el("input", { type: "search", placeholder: "Search this transcript", "aria-label": "Search this transcript", value: state.query,
+    oninput: (e) => { state.query = e.target.value; replace.hidden = !state.query.trim(); renderTurns(); } });
+  return el("div", { class: "toolbar" }, el("div", { class: "search" }, icon("search"), search), count, replace);
 }
 
 function renderTurns() {
@@ -265,8 +333,9 @@ function turnsEls(t) {
     prev = turn;
   }
   const counter = $("#match-count");
-  if (counter) counter.textContent = q ? plural(matches, "match") : "";
-  if (!t.turns.length) out.push(el("p", { class: "muted" }, t.status === "ready" ? "No speech was found in this recording." : "The transcript appears here when processing is done."));
+  if (counter) counter.textContent = q ? plural(matches, "match", "matches") : "";
+  if (!t.turns.length) out.push(el("p", { class: "empty-turns" }, t.status === "ready" ? "No speech was found in this recording." : "The transcript appears here when processing is done."));
+  else if (q && !out.length) out.push(el("p", { class: "empty-turns" }, `Nothing in this transcript matches “${state.query.trim()}”.`));
   return out;
 }
 
@@ -275,15 +344,16 @@ function turnEl(t, turn, prev) {
   const cont = prev && prev.speaker === turn.speaker;
   const ready = t.status === "ready";
   return el("div", { class: `turn${cont ? " cont" : ""}`, "data-id": turn.id, style: `--c:${color(turn.speaker)}` },
-    el("div", { class: "gutter" }, el("button", { class: "time", title: "Play from here", onclick: () => playFrom(turn.start) }, fmt(turn.start)),
-      cont && ready ? el("button", { class: "mini", title: `${s.name} - change speaker`, onclick: (e) => turnSpeakerMenu(e.currentTarget, turn) }, "⇄") : null),
+    el("div", { class: "gutter" },
+      cont && ready ? el("button", { class: "mini", title: `${s.name}. Click to change the speaker of this line`, "aria-label": `Change speaker (${s.name})`, onclick: (e) => turnSpeakerMenu(e.currentTarget, turn) }, "⇄") : null,
+      el("button", { class: "time", title: "Play from here", onclick: () => playFrom(turn.start) }, fmt(turn.start))),
     el("div", {},
       el("button", { class: "who", title: ready ? "Change or name this speaker" : "", disabled: !ready, onclick: (e) => turnSpeakerMenu(e.currentTarget, turn) }, s.name),
       textEl(turn, ready)));
 }
 
 function textEl(turn, editable = true) {
-  const p = el("p", { class: "text", onclick: editable ? (e) => maybeEdit(e, turn) : null });
+  const p = el("p", { class: editable ? "text editable" : "text", dir: "auto", onclick: editable ? (e) => maybeEdit(e, turn) : null });
   const q = state.query.trim();
   if (q) p.append(...highlight(turn.text, [q]));
   else if (!turn.edited && !turn.autofix && turn.words?.length) {
@@ -436,7 +506,7 @@ function speakerMenu(anchor, label) {
   const into = el("select", {}, others.map((k) => el("option", { value: k }, t.speakers[k].name)));
   popover(anchor, el("div", {},
     el("div", { class: "pop-title" }, label === "ME" ? "Your name" : `Who is ${s.name}?`),
-    el("button", { class: "link", style: "align-self:flex-start", onclick: () => playSample(label) }, "▶ Play a sample of their voice"),
+    el("button", { class: "link", onclick: () => playSample(label) }, "Play a sample of their voice"),
     name,
     label !== "ME" ? el("label", { class: "check" }, remember, "Remember this voice for future calls") : null,
     el("div", { class: "row" }, el("button", { class: "primary", onclick: save }, "Save name")),
@@ -454,7 +524,7 @@ function turnSpeakerMenu(anchor, turn) {
   popover(anchor, el("div", {},
     el("div", { class: "pop-title" }, "Who said this?"),
     Object.keys(t.speakers).map((k) => el("button", { class: "menu-item", style: `--c:${color(k)}`, disabled: k === turn.speaker, onclick: () => move(k) },
-      el("span", { class: "dot" }), t.speakers[k].name, k === turn.speaker ? el("span", { class: "muted small" }, " (now)") : null)),
+      el("span", { class: "swatch" }), t.speakers[k].name, k === turn.speaker ? el("span", { class: "muted small" }, "(now)") : null)),
     el("button", { class: "menu-item", onclick: () => move("new") }, "+ Someone else (new speaker)"),
     el("div", { class: "sep" }),
     el("button", { class: "link", onclick: (e) => speakerMenu(anchor, turn.speaker) }, `Rename ${(t.speakers[turn.speaker] || {}).name || "this speaker"}…`)));
@@ -487,27 +557,136 @@ function playSample(label) {
   if (best) playFrom(best.start);
 }
 
-// ---------- audio ----------
+// ---------- audio: the seek bar is the call's voice timeline ----------
+
+const audioEl = () => $("#player-bar audio");
 
 function renderPlayer(t) {
   const bar = $("#player-bar");
-  if (t.status !== "ready") { bar.hidden = true; return; }
+  if (t.status !== "ready") { bar.hidden = true; audioEl()?.pause(); return; }
   if (bar.dataset.id !== t.id) {
     bar.dataset.id = t.id;
-    bar.replaceChildren(el("audio", { controls: true, preload: "metadata", src: `/api/transcripts/${t.id}/audio`, ontimeupdate: onTime }));
     state.playingId = null;
+    const audio = el("audio", { preload: "metadata", src: `/api/transcripts/${t.id}/audio`,
+      ontimeupdate: onTime, onplay: syncPlayer, onpause: syncPlayer, onended: syncPlayer, onloadedmetadata: syncPlayer });
+    audio.defaultPlaybackRate = audio.playbackRate = state.rate;
+    bar.replaceChildren(el("div", { class: "player" }, audio,
+      el("div", { class: "transport" },
+        el("button", { class: "icon-btn", title: "Back 5 seconds", "aria-label": "Back 5 seconds", onclick: () => skip(-5) }, icon("back")),
+        el("button", { class: "play-btn", "aria-label": "Play", onclick: togglePlay }, icon("play"), icon("pause"))),
+      el("div", { class: "track-row" },
+        el("span", { class: "clock now" }, "0:00"),
+        timelineEl(t),
+        el("span", { class: "clock total" }, fmt(t.duration)),
+        el("button", { class: "rate", title: "Playback speed", onclick: cycleRate }, `${state.rate}×`),
+        el("label", { class: "follow", title: "Keep the line being played in view" },
+          el("input", { type: "checkbox", checked: state.follow, onchange: (e) => { state.follow = e.target.checked; } }),
+          "Follow audio"))));
   }
+  drawTimeline(t);
   bar.hidden = false;
+  syncPlayer();
+}
+
+function timelineEl(t) {
+  const seek = el("input", { type: "range", class: "seek", min: 0, max: t.duration || 0, step: "any", "aria-label": "Position in the call", value: 0,
+    oninput: (e) => { const a = audioEl(); if (a) { a.currentTime = Number(e.target.value); syncPlayer(); } },
+    onkeydown: (e) => { if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); skip(e.key === "ArrowLeft" ? -5 : 5); } },
+    onpointerdown: () => { state.seeking = true; },
+    onpointerup: () => { state.seeking = false; },
+    onchange: () => { state.seeking = false; } });
+  return el("div", { class: "timeline", id: "timeline", onpointermove: timelineHover, onpointerleave: (e) => {
+    e.currentTarget.querySelector(".tip").hidden = true;
+    e.currentTarget.querySelector(".hover-line").hidden = true;
+  } }, el("div", { class: "track" }), el("div", { class: "hover-line", hidden: true }), el("div", { class: "playhead" }), el("div", { class: "tip", hidden: true }), seek);
+}
+
+/** Consecutive lines by the same speaker, joined across short pauses, so the strip shows who held the floor. */
+function voiceRuns(t) {
+  const runs = [];
+  for (const x of t.turns) {
+    const last = runs[runs.length - 1];
+    if (last && last.speaker === x.speaker && x.start - last.end < 2) last.end = Math.max(last.end, x.end);
+    else runs.push({ speaker: x.speaker, start: x.start, end: x.end });
+  }
+  return runs;
+}
+
+function drawTimeline(t) {
+  const track = $("#timeline .track");
+  if (!track) return;
+  const d = t.duration || 1;
+  const pct = (sec) => (100 * sec / d).toFixed(3);
+  track.replaceChildren(...voiceRuns(t).map((r) => el("i", { class: "seg",
+    style: `--c:${color(r.speaker)};left:${pct(r.start)}%;width:max(1px, calc(${pct(r.end - r.start)}% - 2px))` })));
+  $("#timeline .seek").max = t.duration || 0;
+}
+
+function turnAt(t, sec) {
+  let lo = 0, hi = t.turns.length - 1;
+  if (hi < 0) return null;
+  while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (t.turns[mid].start <= sec) lo = mid; else hi = mid - 1; }
+  const turn = t.turns[lo];
+  return turn.start <= sec && sec <= turn.end + 0.5 ? turn : null;
+}
+
+function timelineHover(e) {
+  const t = state.t;
+  if (!t) return;
+  const box = e.currentTarget, r = box.getBoundingClientRect();
+  const f = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  const sec = f * (t.duration || 0);
+  const turn = turnAt(t, sec);
+  const tip = box.querySelector(".tip"), line = box.querySelector(".hover-line");
+  tip.replaceChildren(el("b", {}, fmt(sec)), ...(turn ? [el("span", { class: "key", style: `--c:${color(turn.speaker)}` }),
+    el("span", { class: "who-name" }, (t.speakers[turn.speaker] || {}).name || turn.speaker)] : []));
+  tip.hidden = line.hidden = false;
+  line.style.left = `${f * 100}%`;
+  tip.style.left = `${Math.min(Math.max(0, f * r.width - tip.offsetWidth / 2), r.width - tip.offsetWidth)}px`;
+}
+
+function syncPlayer() {
+  const a = audioEl(), box = $("#timeline");
+  if (!a || !box || !state.t) return;
+  const d = state.t.duration || a.duration || 0, now = a.currentTime || 0;
+  $(".player").classList.toggle("is-playing", !a.paused);
+  $(".play-btn").setAttribute("aria-label", a.paused ? "Play" : "Pause");
+  $(".clock.now").textContent = fmt(now);
+  box.style.setProperty("--p", d ? Math.min(1, now / d) : 0);
+  const seek = box.querySelector(".seek");
+  if (!state.seeking) seek.value = now;
+  seek.setAttribute("aria-valuetext", `${fmt(now)} of ${fmt(d)}`);
+}
+
+function togglePlay() {
+  const a = audioEl();
+  if (a) a.paused ? a.play().catch(() => {}) : a.pause();
+}
+
+function skip(delta) {
+  const a = audioEl();
+  if (!a) return;
+  a.currentTime = Math.min(Math.max(0, a.currentTime + delta), a.duration || state.t?.duration || 0);
+  syncPlayer();
+}
+
+function cycleRate(e) {
+  state.rate = RATES[(RATES.indexOf(state.rate) + 1) % RATES.length];
+  const a = audioEl();
+  if (a) a.defaultPlaybackRate = a.playbackRate = state.rate;
+  e.currentTarget.textContent = `${state.rate}×`;
+  try { localStorage.setItem("tadween.rate", String(state.rate)); } catch {}
 }
 
 function playFrom(sec) {
-  const audio = $("#player-bar audio");
+  const audio = audioEl();
   if (!audio) return;
   audio.currentTime = Math.max(0, sec - 0.3);
-  audio.play();
+  audio.play().catch(() => {});
 }
 
 function onTime(e) {
+  syncPlayer();
   const t = state.t;
   if (!t || !t.turns.length) return;
   const now = e.target.currentTime;
@@ -520,7 +699,7 @@ function onTime(e) {
   const node = document.querySelector(`.turn[data-id="${turn.id}"]`);
   if (!node) return;
   node.classList.add("playing");
-  if (state.follow && !e.target.paused && !state.editing) node.scrollIntoView({ block: "center", behavior: "smooth" });
+  if (state.follow && !e.target.paused && !state.editing) node.scrollIntoView({ block: "center", behavior: reduceMotion.matches ? "auto" : "smooth" });
 }
 
 // ---------- uploads ----------
@@ -553,51 +732,57 @@ addEventListener("drop", (e) => {
 function renderLive() {
   if (!state.live.running) return renderLiveStart();
   const L = state.live;
-  const stop = el("button", { class: "primary", style: "background:var(--rec)", onclick: async (e) => {
-    e.currentTarget.disabled = true;
-    e.currentTarget.textContent = "Saving…";
+  const stop = el("button", { class: "stop", onclick: async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.replaceChildren("Saving…");
     try {
       const r = await api("POST", "/api/live/stop");
       state.live = { running: false };
       renderList();
       location.hash = r.id ? `#/t/${r.id}` : "#/";
-    } catch (err) { fail(err); }
-  } }, "■ Stop");
+    } catch (err) { fail(err); btn.disabled = false; btn.replaceChildren(icon("stop"), "Stop"); }
+  } }, icon("stop"), "Stop");
   view(
     el("div", { class: "header" },
-      el("div", { class: "live-head" }, el("h1", {}, L.title), el("span", { class: "elapsed", id: "elapsed" }, fmt((Date.now() / 1000) - L.started)), stop),
-      el("div", { class: "sources", id: "sources" }, sourcesEls()),
-      el("div", { id: "speakers" }, liveSpeakersEl())),
-    el("div", { id: "turns-scroll", class: "scroll" }, el("div", { id: "turns" }, liveLinesEls())));
+      el("div", { class: "col indent" },
+        el("div", { class: "live-head" }, el("h1", {}, L.title),
+          el("span", { class: "recording", id: "elapsed", title: "Recording time" }, fmt((Date.now() / 1000) - L.started)), stop),
+        el("div", { class: "sources", id: "sources" }, sourcesEls()),
+        el("div", { id: "speakers" }, liveSpeakersEl()))),
+    el("div", { id: "turns-scroll", class: "scroll" }, el("div", { id: "turns", class: "col" }, liveLinesEls())));
   scrollLiveToEnd(true);
 }
 
 function sourcesEls() {
   const names = { mic: "Your mic", system: "Call audio" };
   return (state.live.sources || []).map((s) => el("span", { class: `src${s.error ? " error" : s.speaking ? " speaking" : s.ready ? " ready" : ""}`, title: s.error || "" },
-    `${names[s.name] || s.name}${s.error ? ` - ${s.error}` : s.ready ? "" : " - starting…"}`));
+    el("span", { class: "level", "aria-hidden": "true" }, el("i"), el("i"), el("i")),
+    `${names[s.name] || s.name}${s.error ? `: ${s.error}` : s.ready ? "" : " (starting…)"}`));
 }
 
 function liveSpeakersEl() {
   const sp = state.live.speakers || {};
-  return el("div", { class: "speakers" }, Object.keys(sp).map((k) =>
-    el("button", { class: "chip", style: `--c:${color(k)}`, onclick: (e) => liveRename(e.currentTarget, k) }, el("span", { class: "dot" }), sp[k].name,
-      sp[k].person && !sp[k].manual ? el("span", { class: "badge" }, "auto") : null)),
-    Object.values(sp).some((s) => isDefaultName(s.name)) ? el("span", { class: "hint" }, "Click a speaker to name them as you go.") : null);
+  return el("div", {},
+    el("div", { class: "speakers" }, Object.keys(sp).map((k) =>
+      el("button", { class: "chip", style: `--c:${color(k)}`, onclick: (e) => liveRename(e.currentTarget, k) }, el("span", { class: "swatch" }), sp[k].name,
+        sp[k].person && !sp[k].manual ? voiceMatchEl(sp[k]) : null))),
+    Object.values(sp).some((s) => isDefaultName(s.name))
+      ? el("div", { class: "speakers-foot" }, el("span", { class: "hint" }, "Click a speaker to name them as you go.")) : null);
 }
 
 function liveLinesEls() {
   const sp = state.live.speakers || {};
   const lines = state.live.lines || [];
-  if (!lines.length) return [el("p", { class: "muted" }, "Listening… lines appear a moment after each person finishes a sentence.")];
+  if (!lines.length) return [el("p", { class: "empty-turns" }, "Listening… Lines appear a moment after each person finishes a sentence.")];
   let prev = null;
   return lines.map((line) => {
     const cont = prev && prev.speaker === line.speaker;
     prev = line;
     return el("div", { class: `turn${cont ? " cont" : ""}`, "data-index": line.index, style: `--c:${color(line.speaker)}` },
       el("div", { class: "gutter" }, el("span", { class: "time" }, fmt(line.start))),
-      el("div", {}, el("button", { class: "who", onclick: (e) => liveRename(e.currentTarget, line.speaker) }, (sp[line.speaker] || {}).name || line.speaker),
-        el("p", { class: "text" }, ...(line.autofix ? highlight(line.text, line.autofix, "span", "fixed") : [line.text]))));
+      el("div", {}, el("button", { class: "who", title: "Name this speaker", onclick: (e) => liveRename(e.currentTarget, line.speaker) }, (sp[line.speaker] || {}).name || line.speaker),
+        el("p", { class: "text", dir: "auto" }, ...(line.autofix ? highlight(line.text, line.autofix, "span", "fixed") : [line.text]))));
   });
 }
 
@@ -620,7 +805,7 @@ function liveRename(anchor, label) {
   name.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
   popover(anchor, el("div", {}, el("div", { class: "pop-title" }, label === "ME" ? "Your name" : `Who is ${s.name}?`), name,
     label !== "ME" ? el("label", { class: "check" }, remember, "Remember this voice for future calls") : null,
-    el("div", { class: "row" }, el("button", { class: "primary", onclick: save }, "Save"))));
+    el("div", { class: "row" }, el("button", { class: "primary", onclick: save }, "Save name"))));
 }
 
 function refreshLive() {
@@ -635,28 +820,32 @@ function renderLiveStart() {
   const title = el("input", { placeholder: `Call ${new Date().toLocaleDateString(undefined, { month: "short", day: "numeric" })}` });
   const mic = el("input", { type: "checkbox", checked: true });
   const sys = el("input", { type: "checkbox", checked: true });
-  const apps = el("input", { placeholder: "Optional, e.g. zoom.us or Chrome" });
+  const apps = el("input", { placeholder: "Optional, for example zoom.us or Google Chrome" });
+  const startLabel = () => [el("span", { class: "rec" }), "Start transcribing"];
   const go = el("button", { class: "primary big", disabled: !state.capture, onclick: async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
-    btn.textContent = "Starting (loading the speech model)…";
+    btn.replaceChildren("Starting (loading the speech model)…");
     try {
       state.live = await api("POST", "/api/live/start", { title: title.value.trim() || null, mic: mic.checked, system: sys.checked, apps: apps.value.trim() });
       renderList();
       renderLive();
-    } catch (err) { fail(err); btn.disabled = false; btn.textContent = "● Start"; }
-  } }, "● Start");
-  view(el("div", { class: "page narrow" },
+    } catch (err) { fail(err); btn.disabled = false; btn.replaceChildren(...startLabel()); }
+  } }, startLabel());
+  const source = (input, label, help) => el("label", { class: "check" }, input, el("span", { class: "check-text" }, el("span", {}, label), el("span", { class: "muted" }, help)));
+  view(pageView(
     el("h1", {}, "Live transcription"),
-    el("p", { class: "muted" }, "Tadween listens to your microphone (that's you) and to this Mac's sound output (everyone else on the call), and writes down who said what while you talk."),
+    el("p", { class: "lede" }, "Tadween listens to your microphone (that's you) and to this Mac's sound output (everyone else on the call), and writes down who said what while you talk."),
     state.capture ? null : el("div", { class: "warn" }, "The audio capture helper isn't built yet. In a terminal, run ", el("code", {}, "./setup.sh"), " in the Tadween folder, then reload this page."),
     field("Title", title),
-    el("label", { class: "check" }, mic, "Your microphone - labelled as you"),
-    el("label", { class: "check" }, sys, "Call audio - everyone else (Zoom, Meet, Teams, Slack…)"),
-    field("Only capture sound from this app", apps, "Leave empty to capture all sound. Start Tadween after the meeting app is open."),
+    el("div", { class: "field" }, el("span", {}, "Listen to"),
+      el("div", { class: "group" },
+        source(mic, "Your microphone", "Labelled as you"),
+        source(sys, "Call audio", "Everyone else on Zoom, Meet, Teams, Slack or any other app"))),
+    field("Only capture sound from this app", apps, "Leave empty to capture all sound. Open the meeting app before you start."),
     go,
-    el("div", { class: "note" },
-      el("b", {}, "First time? "), "macOS will ask for Microphone and Screen & System Audio Recording permission for the app that runs Tadween (Terminal or VS Code). Allow both, then quit and reopen that app. ",
+    el("p", { class: "note" },
+      el("b", {}, "First time? "), "macOS asks for Microphone and Screen & System Audio Recording permission for the app that runs Tadween (Terminal or VS Code). Allow both, then quit and reopen that app. ",
       "Headphones give the cleanest result. When you press Stop, Tadween transcribes the whole call again with full context and regroups the voices for the final version.")));
 }
 
@@ -665,51 +854,69 @@ function renderLiveStart() {
 async function renderVocabulary() {
   let data;
   try { data = await api("GET", "/api/vocabulary"); } catch (e) { return fail(e); }
-  const from = el("input", { placeholder: "Heard as (e.g. post gress)" });
-  const to = el("input", { placeholder: "Should be (e.g. Postgres)" });
+  const from = el("input", { placeholder: "Heard as, e.g. post gress", "aria-label": "Heard as" });
+  const to = el("input", { placeholder: "Should be, e.g. Postgres", "aria-label": "Should be" });
   const add = async () => {
-    if (!from.value.trim() || !to.value.trim()) return;
+    if (!from.value.trim() || !to.value.trim()) return (from.value.trim() ? to : from).focus();
     try { await api("POST", "/api/vocabulary/corrections", { from: from.value, to: to.value }); renderVocabulary(); } catch (e) { fail(e); }
   };
-  const terms = el("textarea", { rows: 6, placeholder: "One per line - names, products, jargon" });
+  for (const input of [from, to]) input.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+  const terms = el("textarea", { rows: 6, placeholder: "One per line: names, products, jargon", "aria-label": "Words to expect" });
   terms.value = data.terms.join("\n");
-  view(el("div", { class: "page narrow" },
+  view(pageView(
     el("h1", {}, "Word fixes"),
-    el("p", { class: "muted" }, "Fixes you choose to remember are applied to every new transcript, and the corrected words are given to Whisper so it spells them right in the first place."),
+    el("p", { class: "lede" }, "Fixes you choose to remember are applied to every new transcript. The corrected words are also given to Whisper, so it spells them right in the first place."),
     el("table", { class: "list" },
-      el("tr", {}, el("th", {}, "Heard as"), el("th", {}, "Becomes"), el("th", {})),
-      data.corrections.length ? data.corrections.map((c) => el("tr", {}, el("td", {}, c.from), el("td", {}, el("b", {}, c.to)),
-        el("td", {}, el("button", { class: "ghost danger", onclick: async () => { try { await api("DELETE", `/api/vocabulary/corrections?from=${encodeURIComponent(c.from)}`); renderVocabulary(); } catch (e) { fail(e); } } }, "Remove"))))
-        : el("tr", {}, el("td", { colspan: 3, class: "muted" }, "No fixes yet. Edit a word in a transcript and choose “remember”."))),
-    el("div", { class: "inline-form" }, from, to, el("button", { onclick: add }, "Add")),
+      el("thead", {}, el("tr", {}, el("th", {}, "Heard as"), el("th", {}, "Becomes"), el("th", {}, el("span", { class: "visually-hidden" }, "Actions")))),
+      el("tbody", {}, data.corrections.length
+        ? data.corrections.map((c) => el("tr", {}, el("td", { class: "heard" }, c.from), el("td", { class: "strong" }, c.to),
+          el("td", {}, el("button", { class: "ghost quiet-danger", onclick: async () => {
+            try { await api("DELETE", `/api/vocabulary/corrections?from=${encodeURIComponent(c.from)}`); renderVocabulary(); } catch (e) { fail(e); }
+          } }, "Remove"))))
+        : el("tr", {}, el("td", { colspan: 3, class: "empty" }, "No fixes yet. Edit a word in a transcript and choose “remember”, or add one below.")))),
+    el("div", { class: "inline-form" }, from, to, el("button", { onclick: add }, "Add fix")),
     el("h2", {}, "Words to expect"),
-    el("p", { class: "muted small" }, "Names, products and jargon that come up in your calls. Whisper is told to expect them."),
+    el("p", { class: "lede" }, "Names, products and jargon that come up in your calls. Whisper is told to expect them."),
     terms,
-    el("div", { class: "inline-form" }, el("button", { class: "primary", onclick: async () => {
-      try { await api("PUT", "/api/vocabulary/terms", { terms: terms.value.split("\n") }); toast("Saved."); } catch (e) { fail(e); }
+    el("div", { class: "actions-row" }, el("button", { class: "primary", onclick: async () => {
+      try { await api("PUT", "/api/vocabulary/terms", { terms: terms.value.split("\n") }); toast("Words saved."); } catch (e) { fail(e); }
     } }, "Save words"))));
 }
 
 async function renderPeople() {
   let people;
   try { people = await api("GET", "/api/people"); } catch (e) { return fail(e); }
-  view(el("div", { class: "page narrow" },
+  view(pageView(
     el("h1", {}, "Known voices"),
-    el("p", { class: "muted" }, "When you name a speaker with “remember this voice”, Tadween stores a voiceprint (numbers describing the voice, not audio) and labels that person automatically in later calls."),
+    el("p", { class: "lede" }, "When you name a speaker with “remember this voice”, Tadween stores a voiceprint (numbers describing the voice, not audio) and labels that person automatically in later calls."),
     el("table", { class: "list" },
-      el("tr", {}, el("th", {}, "Name"), el("th", {}, "Samples"), el("th", {}, "Last updated"), el("th", {})),
-      people.length ? people.map((p) => el("tr", {},
-        el("td", {}, el("b", {}, p.name)), el("td", {}, String(p.samples)), el("td", { class: "muted" }, new Date(p.updated * 1000).toLocaleDateString()),
-        el("td", {},
-          el("button", { class: "ghost", onclick: async () => {
-            const name = prompt("New name", p.name);
-            if (name && name.trim()) { try { await api("PATCH", `/api/people/${p.id}`, { name: name.trim() }); renderPeople(); } catch (e) { fail(e); } }
-          } }, "Rename"),
-          el("button", { class: "ghost danger", onclick: async () => {
-            if (!confirm(`Forget ${p.name}'s voice?`)) return;
-            try { await api("DELETE", `/api/people/${p.id}`); renderPeople(); } catch (e) { fail(e); }
-          } }, "Forget"))))
-        : el("tr", {}, el("td", { colspan: 4, class: "muted" }, "No voices yet. Open a transcript and click a speaker to name them.")))));
+      el("thead", {}, el("tr", {}, el("th", {}, "Name"), el("th", {}, "Samples"), el("th", {}, "Last updated"), el("th", {}, el("span", { class: "visually-hidden" }, "Actions")))),
+      el("tbody", {}, people.length
+        ? people.map((p) => el("tr", {},
+          el("td", { class: "strong" }, p.name), el("td", { class: "num" }, String(p.samples)),
+          el("td", { class: "heard" }, new Date(p.updated * 1000).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" })),
+          el("td", {},
+            el("button", { class: "ghost", onclick: (e) => renamePerson(e.currentTarget, p) }, "Rename"),
+            el("button", { class: "ghost quiet-danger", onclick: async () => {
+              if (!confirm(`Forget ${p.name}'s voice?`)) return;
+              try { await api("DELETE", `/api/people/${p.id}`); renderPeople(); } catch (e) { fail(e); }
+            } }, "Forget"))))
+        : el("tr", {}, el("td", { colspan: 4, class: "empty" }, "No voices yet. Open a transcript and click a speaker to name them."))))));
+}
+
+function renamePerson(anchor, p) {
+  const name = el("input", { value: p.name, "aria-label": "Name" });
+  const save = async () => {
+    const v = name.value.trim();
+    if (!v) return name.focus();
+    closePopover();
+    if (v === p.name) return;
+    try { await api("PATCH", `/api/people/${p.id}`, { name: v }); renderPeople(); } catch (e) { fail(e); }
+  };
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter") save(); });
+  popover(anchor, el("div", {}, el("div", { class: "pop-title" }, "Rename this voice"), name,
+    el("div", { class: "row" }, el("button", { class: "primary", onclick: save }, "Save name"))));
+  name.select();
 }
 
 async function renderSettings() {
@@ -722,21 +929,28 @@ async function renderSettings() {
   const sep = el("input", { type: "range", min: 0.5, max: 1.0, step: 0.05, value: s.speaker_threshold });
   const match = el("input", { type: "range", min: 0.3, max: 0.8, step: 0.05, value: s.voice_match_threshold });
   const prompt = el("input", { value: s.initial_prompt });
-  view(el("div", { class: "page narrow" },
+  const setting = (label, help, control, stack = false) => el("label", { class: `setting${stack ? " stack" : ""}` },
+    el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, label), help ? el("span", { class: "setting-help" }, help) : null), control);
+  const scale = (input, left, right) => el("span", {}, input, el("span", { class: "range-ends", "aria-hidden": "true" }, el("span", {}, left), el("span", {}, right)));
+  view(pageView(
     el("h1", {}, "Settings"),
-    field("Your name", name, "Used for your microphone in live calls."),
-    field("Language spoken in calls", lang),
-    field("Voice grouping", sep, "Left: split voices more readily (more speakers). Right: merge similar voices (fewer speakers). Applies to new transcripts; use “People” in a transcript to regroup it."),
-    field("Recognising saved voices", match, "Left: name people more eagerly. Right: only when very sure."),
-    field("Whisper style prompt", prompt, "A punctuated sentence Whisper imitates. Keep it short."),
-    field("CPU threads for transcription", threads),
-    el("button", { class: "primary", onclick: async () => {
+    el("h2", {}, "Transcription"),
+    el("div", { class: "group" },
+      setting("Your name", "Used for your microphone in live calls.", name),
+      setting("Language spoken in calls", null, lang),
+      setting("Whisper style prompt", "A punctuated sentence Whisper imitates. Keep it short.", prompt),
+      setting("CPU threads", "How many processor threads transcription uses.", threads)),
+    el("h2", {}, "Voices"),
+    el("div", { class: "group" },
+      setting("Voice grouping", "Applies to new transcripts. To regroup an existing one, use Speakers in its header.", scale(sep, "More speakers", "Fewer speakers"), true),
+      setting("Recognising saved voices", "How sure Tadween must be before it names someone from a saved voice.", scale(match, "Name people more eagerly", "Only when very sure"), true)),
+    el("div", { class: "form-foot" }, el("button", { class: "primary", onclick: async () => {
       try {
         state.settings = await api("PUT", "/api/settings", { my_name: name.value.trim() || "Me", language: lang.value, threads: Number(threads.value) || 6,
           speaker_threshold: Number(sep.value), voice_match_threshold: Number(match.value), initial_prompt: prompt.value.trim() });
         toast("Settings saved.");
       } catch (e) { fail(e); }
-    } }, "Save settings")));
+    } }, "Save settings"))));
 }
 
 // ---------- live updates from the server ----------
@@ -749,8 +963,10 @@ const handlers = {
     if (item) { item.status = "processing"; item.progress = m.progress; renderList(); }
     if (state.t?.id === m.id) {
       if (!$("#progress")) return reloadTranscript();
+      const pct = `${Math.round((m.progress.fraction || 0) * 100)}%`;
       $("#progress-stage").textContent = m.progress.stage;
-      $("#progress-fill").style.width = `${Math.round((m.progress.fraction || 0) * 100)}%`;
+      $("#progress-pct").textContent = pct;
+      $("#progress-fill").style.width = pct;
     }
   },
   transcript: (m) => {
@@ -791,12 +1007,10 @@ function connectEvents() {
   };
 }
 
-setInterval(() => {
-  const node = $("#elapsed");
-  if (node && state.live.running) node.textContent = fmt(Date.now() / 1000 - state.live.started);
-}, 1000);
+setInterval(tickClocks, 1000);
 
 (async function init() {
+  try { const r = Number(localStorage.getItem("tadween.rate")); if (RATES.includes(r)) state.rate = r; } catch {}
   try {
     const s = await api("GET", "/api/state");
     state.settings = s.settings;
