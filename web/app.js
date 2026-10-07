@@ -5,7 +5,7 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const SPEAKER_HUES = 8; // --s1 … --s8 in style.css; later speakers share a neutral grey rather than repeating a hue
 const RATES = [1, 1.25, 1.5, 1.75, 2];
-const state = { list: [], t: null, settings: {}, live: { running: false }, capture: true, query: "", follow: true, editing: null, stale: false, playingId: null, seeking: false, rate: 1 };
+const state = { list: [], t: null, settings: {}, live: { running: false }, capture: true, query: "", follow: true, editing: null, stale: false, regrouping: 0, reloadedAt: 0, playingId: null, seeking: false, rate: 1 };
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
 // ---------- small helpers ----------
@@ -44,6 +44,7 @@ const fmtDur = (sec) => { const m = Math.round((sec || 0) / 60); return m >= 60 
 const fmtDate = (iso) => new Date(iso).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 const plural = (n, word, many = `${word}s`) => `${n.toLocaleString()} ${n === 1 ? word : many}`;
 const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const squash = (s) => s.replace(/\s+/g, " ").trim();
 const isDefaultName = (name) => /^Speaker \d+$/.test(name);
 
 function color(label) {
@@ -98,6 +99,8 @@ const fail = (err) => toast(err?.message || String(err), [], { kind: "error", ti
 
 function popover(anchor, content) {
   closePopover();
+  if (!anchor) return;
+  const opener = document.activeElement;
   const pop = $("#popover");
   pop.replaceChildren(content);
   pop.hidden = false;
@@ -108,12 +111,17 @@ function popover(anchor, content) {
   const outside = (e) => { if (!pop.contains(e.target) && !anchor.contains(e.target)) closePopover(); };
   const esc = (e) => { if (e.key === "Escape") closePopover(); };
   setTimeout(() => { document.addEventListener("mousedown", outside); document.addEventListener("keydown", esc); });
-  state.closePop = () => { pop.hidden = true; document.removeEventListener("mousedown", outside); document.removeEventListener("keydown", esc); state.closePop = null; };
-  pop.querySelector("input:not([type=checkbox])")?.focus();
+  state.closePop = () => {
+    const inside = pop.contains(document.activeElement);
+    pop.hidden = true; document.removeEventListener("mousedown", outside); document.removeEventListener("keydown", esc); state.closePop = null;
+    if (inside) (anchor.isConnected ? anchor : opener)?.focus?.(); // keyboard users carry on where they were
+  };
+  (pop.querySelector("input:not([type=checkbox])") || pop.querySelector("button:not(:disabled), a[href], select"))?.focus();
 }
 function closePopover() { state.closePop?.(); }
 
-const view = (...nodes) => $("#view").replaceChildren(...nodes);
+// Blur first: WebKit and Firefox fire no blur for a removed element, so a line or title being edited would never be saved.
+const view = (...nodes) => { if ($("#view").contains(document.activeElement)) document.activeElement.blur(); $("#view").replaceChildren(...nodes); };
 const field = (label, input, help) => el("label", { class: "field" }, el("span", {}, label), input, help ? el("div", { class: "help" }, help) : null);
 
 // ---------- sidebar ----------
@@ -138,7 +146,9 @@ function renderList() {
   const items = state.list.map((item) => el("li", {},
     el("a", { href: `#/t/${item.id}`, class: state.t?.id === item.id ? "active" : "", "aria-current": state.t?.id === item.id ? "page" : null },
       el("span", { class: "title" }, item.title), statusEls(item))));
+  const focused = $("#transcript-list").contains(document.activeElement) && document.activeElement.getAttribute("href");
   $("#transcript-list").replaceChildren(...(items.length ? items : [el("li", { class: "empty" }, "No transcripts yet")]));
+  if (focused) $(`#transcript-list a[href="${focused}"]`)?.focus(); // progress updates rebuild the list
   const live = state.live.running;
   $("#live-link").classList.toggle("on", live);
   $("#live-label").textContent = live ? "Recording" : "Start live transcription";
@@ -161,9 +171,13 @@ function markNav(page) {
 }
 
 function setNav(open) {
+  const was = document.body.classList.contains("nav-open");
   document.body.classList.toggle("nav-open", open);
   $("#menu-button").setAttribute("aria-expanded", String(open));
+  if (open && !was) $("#live-link").focus();
+  else if (!open && was && $("#sidebar").contains(document.activeElement)) $("#menu-button").focus();
 }
+addEventListener("keydown", (e) => { if (e.key === "Escape" && document.body.classList.contains("nav-open")) setNav(false); });
 $("#menu-button").addEventListener("click", () => setNav(!document.body.classList.contains("nav-open")));
 $("#scrim").addEventListener("click", () => setNav(false));
 
@@ -172,6 +186,7 @@ $("#scrim").addEventListener("click", () => setNav(false));
 function route() {
   closePopover();
   hideFixButton();
+  fixToasts.splice(0).forEach((close) => close());
   const [, page, id] = (location.hash.slice(1) || "/").split("/");
   setNav(false);
   markNav(page);
@@ -209,22 +224,34 @@ function renderHome() {
 // ---------- transcript ----------
 
 async function openTranscript(id) {
+  let t;
   try {
-    state.t = await api("GET", `/api/transcripts/${id}`);
+    t = await api("GET", `/api/transcripts/${id}`);
   } catch (e) {
-    fail(e);
-    location.hash = "#/";
+    if (location.hash === `#/t/${id}`) { fail(e); location.hash = "#/"; }
     return;
   }
-  if (state.t.status === "live") { location.hash = "#/live"; return; }
+  if (location.hash !== `#/t/${id}`) return; // the user opened something else while it loaded
+  state.t = t;
+  state.stale = false;
+  if (t.status === "live") { location.hash = "#/live"; return; }
   renderList();
   renderTranscript();
 }
 
+// While the user types in a line, the title or the search box, a reload would replace it, so it waits (state.stale).
+const busy = () => state.editing || document.activeElement?.matches(".header h1, .search input");
+
 async function reloadTranscript() {
-  if (!state.t) return;
-  if (state.editing) { state.stale = true; return; }
-  state.t = await api("GET", `/api/transcripts/${state.t.id}`);
+  const id = state.t?.id;
+  if (!id) return;
+  if (busy()) { state.stale = true; return; }
+  const fresh = await api("GET", `/api/transcripts/${id}`);
+  if (state.t?.id !== id || location.hash !== `#/t/${id}`) return; // the user moved on meanwhile
+  if (busy()) { state.stale = true; return; }
+  state.t = fresh;
+  state.stale = false;
+  state.reloadedAt = Date.now();
   renderTranscript(true);
 }
 
@@ -238,6 +265,7 @@ function renderTranscript(keepScroll = false) {
       const v = e.target.textContent.trim();
       if (v && v !== t.title) { try { await api("PATCH", `/api/transcripts/${t.id}`, { title: v }); t.title = v; await loadList(); } catch (err) { fail(err); } }
       else e.target.textContent = t.title;
+      if (state.stale) reloadTranscript();
     } }, t.title);
   const exportMenu = (e) => popover(e.currentTarget, el("div", {},
     el("div", { class: "pop-title" }, "Download transcript"),
@@ -248,6 +276,7 @@ function renderTranscript(keepScroll = false) {
     try { await api("DELETE", `/api/transcripts/${t.id}`); location.hash = "#/"; await loadList(); } catch (e) { fail(e); }
   };
   const words = t.turns.reduce((n, x) => n + x.text.split(/\s+/).length, 0);
+  renderPlayer(t); // first: a different call's audio resets the playing line before the lines are drawn
   view(
     el("div", { class: "header" },
       el("div", { class: "col indent" },
@@ -260,7 +289,6 @@ function renderTranscript(keepScroll = false) {
         ready ? toolbarEl() : null)),
     el("div", { id: "turns-scroll", class: "scroll" }, el("div", { id: "turns", class: "col" }, turnsEls(t))));
   $("#turns-scroll").scrollTop = top;
-  renderPlayer(t);
 }
 
 function statusEl(t) {
@@ -313,7 +341,8 @@ function toolbarEl() {
   const replace = el("button", { class: "link", hidden: !state.query.trim(), title: "Replace this word or phrase everywhere",
     onclick: (e) => state.query.trim() && openReplace(e.currentTarget, state.query.trim()) }, "Replace…");
   const search = el("input", { type: "search", placeholder: "Search this transcript", "aria-label": "Search this transcript", value: state.query,
-    oninput: (e) => { state.query = e.target.value; replace.hidden = !state.query.trim(); renderTurns(); } });
+    oninput: (e) => { state.query = e.target.value; replace.hidden = !state.query.trim(); renderTurns(); },
+    onblur: () => { if (state.stale) reloadTranscript(); } });
   return el("div", { class: "toolbar" }, el("div", { class: "search" }, icon("search"), search), count, replace);
 }
 
@@ -343,10 +372,11 @@ function turnEl(t, turn, prev) {
   const s = (t.speakers || {})[turn.speaker] || { name: turn.speaker || "…" };
   const cont = prev && prev.speaker === turn.speaker;
   const ready = t.status === "ready";
-  return el("div", { class: `turn${cont ? " cont" : ""}`, "data-id": turn.id, style: `--c:${color(turn.speaker)}` },
+  return el("div", { class: `turn${cont ? " cont" : ""}${turn.id === state.playingId ? " playing" : ""}`, "data-id": turn.id, style: `--c:${color(turn.speaker)}` },
     el("div", { class: "gutter" },
       cont && ready ? el("button", { class: "mini", title: `${s.name}. Click to change the speaker of this line`, "aria-label": `Change speaker (${s.name})`, onclick: (e) => turnSpeakerMenu(e.currentTarget, turn) }, "⇄") : null,
-      el("button", { class: "time", title: "Play from here", onclick: () => playFrom(turn.start) }, fmt(turn.start))),
+      ready ? el("button", { class: "time", title: "Play from here", onclick: () => playFrom(turn.start) }, fmt(turn.start))
+        : el("span", { class: "time" }, fmt(turn.start))), // there's no player until it's ready
     el("div", {},
       el("button", { class: "who", title: ready ? "Change or name this speaker" : "", disabled: !ready, onclick: (e) => turnSpeakerMenu(e.currentTarget, turn) }, s.name),
       textEl(turn, ready)));
@@ -356,10 +386,11 @@ function textEl(turn, editable = true) {
   const p = el("p", { class: editable ? "text editable" : "text", dir: "auto", onclick: editable ? (e) => maybeEdit(e, turn) : null });
   const q = state.query.trim();
   if (q) p.append(...highlight(turn.text, [q]));
-  else if (!turn.edited && !turn.autofix && turn.words?.length) {
+  // Whisper's own words, while they still spell the line: fixes replayed by a regroup change only the text.
+  else if (!turn.edited && !turn.autofix && turn.words?.length && squash(turn.words.map((w) => w.w).join("")) === squash(turn.text)) {
     turn.words.forEach((w, i) => {
       const txt = i === 0 ? w.w.trimStart() : w.w;
-      p.append(w.p < 0.25 && w.w.replace(/[^a-z0-9]/gi, "").length >= 3
+      p.append(w.p < 0.25 && w.w.replace(/[^\p{L}\p{M}\p{N}]/gu, "").length >= 3
         ? el("span", { class: "unsure", title: `Whisper wasn't sure about this word (${Math.round(w.p * 100)}%). Click to fix.` }, txt)
         : txt);
     });
@@ -371,12 +402,15 @@ function textEl(turn, editable = true) {
 // ---------- editing: fix a word once, fix it everywhere ----------
 
 function maybeEdit(e, turn) {
-  if (state.editing) return;
+  if (state.editing || state.regrouping) return; // regrouping renumbers the lines
   const sel = getSelection();
   if (sel && !sel.isCollapsed && sel.toString().trim()) return; // a selection opens "Fix everywhere" instead
+  if (state.stale) return reloadTranscript(); // these lines may be out of date: show the current ones first
   const p = e.currentTarget;
   const { clientX: x, clientY: y } = e;
-  state.editing = turn.id;
+  const tid = state.t.id; // another transcript may be open by the time this line is saved
+  let saved;
+  state.editing = new Promise((resolve) => { saved = resolve; }); // settles once the line is saved (or left as it was)
   hideFixButton();
   p.textContent = turn.text;
   p.contentEditable = "plaintext-only";
@@ -398,39 +432,42 @@ function maybeEdit(e, turn) {
     const text = p.innerText.replace(/\s+/g, " ").trim();
     try {
       if (!cancelled && text && text !== turn.text) {
-        const res = await api("PUT", `/api/transcripts/${state.t.id}/turns/${turn.id}`, { text });
+        const res = await api("PUT", `/api/transcripts/${tid}/turns/${turn.id}`, { text });
         Object.assign(turn, res.turn);
-        offerFixes(res.suggestions);
+        if (state.t?.id === tid) offerFixes(res.suggestions, tid);
       }
     } catch (err) { fail(err); }
     p.replaceWith(textEl(turn));
     state.editing = null;
-    if (state.stale) { state.stale = false; reloadTranscript(); }
+    saved();
+    if (state.stale) reloadTranscript();
   };
   p.addEventListener("keydown", onKey);
   p.addEventListener("blur", onBlur);
 }
 
-function offerFixes(suggestions) {
+const fixToasts = []; // closers of the "Fix all" offers: they are about the transcript on screen, so leaving it closes them
+
+function offerFixes(suggestions, tid) {
   for (const s of (suggestions || []).slice(0, 3)) {
     const what = `“${s.from}” → “${s.to}”`;
     if (s.count > 0) {
-      toast(`${what}. It appears ${plural(s.count, "more time")} in this transcript.`, [
-        [`Fix all ${s.count}`, () => replaceAll(s.from, s.to, false), true],
-        ["Fix all + remember", () => replaceAll(s.from, s.to, true)],
+      fixToasts.push(toast(`${what}. It appears ${plural(s.count, "more time")} in this transcript.`, [
+        [`Fix all ${s.count}`, () => replaceAll(tid, s.from, s.to, false), true],
+        ["Fix all + remember", () => replaceAll(tid, s.from, s.to, true)],
         ["Review…", () => openReplace(null, s.from, s.to)],
-      ], { timeout: 0 });
+      ], { timeout: 0 }));
     } else {
       toast(`${what}. Fix it automatically in future transcripts too?`, [["Remember this fix", () => rememberFix(s.from, s.to), true]], { timeout: 12000 });
     }
   }
 }
 
-async function replaceAll(from, to, remember) {
+async function replaceAll(tid, from, to, remember) {
   try {
-    const r = await api("POST", `/api/transcripts/${state.t.id}/replace`, { from, to, remember });
+    const r = await api("POST", `/api/transcripts/${tid}/replace`, { from, to, remember });
     toast(`Replaced ${plural(r.count, "time")}${remember ? " - future transcripts will be fixed too" : ""}.`);
-    await reloadTranscript();
+    if (state.t?.id === tid) await reloadTranscript();
   } catch (e) { fail(e); }
 }
 
@@ -439,6 +476,7 @@ async function rememberFix(from, to) {
 }
 
 async function openReplace(anchor, from, to = "") {
+  const tid = state.t.id;
   const input = el("input", { value: to, placeholder: "Correct spelling" });
   const remember = el("input", { type: "checkbox", checked: true });
   const count = el("div", { class: "muted small" }, "Counting…");
@@ -447,7 +485,7 @@ async function openReplace(anchor, from, to = "") {
     const v = input.value.trim();
     if (!v) return input.focus();
     closePopover();
-    await replaceAll(from, v, remember.checked);
+    await replaceAll(tid, from, v, remember.checked);
   } }, "Replace all");
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") go.click(); });
   const target = anchor || $(".header h1");
@@ -457,7 +495,7 @@ async function openReplace(anchor, from, to = "") {
     el("label", { class: "check" }, remember, "Also fix it in future transcripts"),
     el("div", { class: "row" }, go)));
   try {
-    const hits = await api("GET", `/api/transcripts/${state.t.id}/occurrences?q=${encodeURIComponent(from)}`);
+    const hits = await api("GET", `/api/transcripts/${tid}/occurrences?q=${encodeURIComponent(from)}`);
     count.textContent = `Appears ${plural(hits.length, "time")} in this transcript${hits.length > 6 ? " - first 6:" : ""}`;
     list.replaceChildren(...hits.slice(0, 6).map((h) => el("div", { class: "hit" },
       el("button", { class: "time", onclick: () => playFrom(h.start) }, fmt(h.start)), "…", h.before, el("mark", {}, h.match), h.after, "…")));
@@ -470,7 +508,7 @@ document.addEventListener("mouseup", (e) => {
   if (state.editing || !state.t || state.t.status !== "ready" || e.target.closest("#fix-button, #popover")) return;
   setTimeout(() => {
     const sel = getSelection();
-    const text = sel?.toString().replace(/\s+/g, " ").trim();
+    const text = sel?.toString().replace(/\s+/g, " ").replace(/^[\s\p{P}]+|[\s\p{P}]+$/gu, ""); // without a comma or quote dragged in
     const inText = sel?.anchorNode?.parentElement?.closest?.(".text");
     if (!text || text.length > 60 || !inText) return hideFixButton();
     const r = sel.getRangeAt(0).getBoundingClientRect();
@@ -487,6 +525,7 @@ document.addEventListener("mouseup", (e) => {
 // ---------- speakers ----------
 
 function speakerMenu(anchor, label) {
+  if (state.regrouping) return; // the labels are about to change
   const t = state.t, s = t.speakers[label];
   const name = el("input", { value: isDefaultName(s.name) ? "" : s.name, placeholder: isDefaultName(s.name) ? "Their name" : s.name });
   const remember = el("input", { type: "checkbox", checked: true });
@@ -495,8 +534,10 @@ function speakerMenu(anchor, label) {
     if (!v) return name.focus();
     closePopover();
     try {
-      await api("POST", `/api/transcripts/${t.id}/speakers/${label}/rename`, { name: v, remember: remember.checked });
-      toast(remember.checked && label !== "ME" ? `Saved. Tadween will recognise ${v}'s voice in future calls.` : `Renamed to ${v}.`);
+      const spk = await api("POST", `/api/transcripts/${t.id}/speakers/${label}/rename`, { name: v, remember: remember.checked });
+      toast(!remember.checked || label === "ME" ? `Renamed to ${v}.`
+        : spk[label]?.person ? `Saved. Tadween will recognise ${v}'s voice in future calls.`
+          : `Renamed to ${v}. There isn't enough of their voice yet for Tadween to remember it.`);
       await reloadTranscript();
       loadList();
     } catch (e) { fail(e); }
@@ -516,6 +557,7 @@ function speakerMenu(anchor, label) {
 }
 
 function turnSpeakerMenu(anchor, turn) {
+  if (state.regrouping) return; // the lines are about to be renumbered
   const t = state.t;
   const move = async (label) => {
     closePopover();
@@ -535,19 +577,23 @@ async function merge(src, dst) {
   closePopover();
   try {
     await api("POST", `/api/transcripts/${t.id}/speakers/merge`, { from: src, into: dst });
-    toast(`Merged into ${t.speakers[dst].name}.`);
     await reloadTranscript();
+    toast(`Merged into ${state.t?.speakers?.[dst]?.name || t.speakers[dst].name}.`);
   } catch (e) { fail(e); }
 }
 
 async function regroup(n) {
   const t = state.t;
+  $(".text.editing")?.blur();
+  await state.editing; // regrouping renumbers the lines, so a line being edited is saved under its id first
   if (t.turns.some((x) => x.edited) && !confirm("Regrouping voices rebuilds the lines. Word fixes are kept, but other hand edits will be lost. Continue?")) {
     renderTranscript(true);
     return;
   }
+  state.regrouping++;
   const close = toast("Regrouping voices…", [], { timeout: 0 });
   try { await api("POST", `/api/transcripts/${t.id}/regroup`, { speakers: n ? Number(n) : null }); await reloadTranscript(); } catch (e) { fail(e); }
+  state.regrouping--;
   close();
 }
 
@@ -563,7 +609,9 @@ const audioEl = () => $("#player-bar audio");
 
 function renderPlayer(t) {
   const bar = $("#player-bar");
-  if (t.status !== "ready") { bar.hidden = true; audioEl()?.pause(); return; }
+  if (t.status !== "ready") { // nothing to play yet: drop the last call's player too, so no click can play it unseen
+    audioEl()?.pause(); bar.replaceChildren(); delete bar.dataset.id; bar.hidden = true; state.playingId = null; return;
+  }
   if (bar.dataset.id !== t.id) {
     bar.dataset.id = t.id;
     state.playingId = null;
@@ -686,6 +734,7 @@ function playFrom(sec) {
 }
 
 function onTime(e) {
+  if (e.target !== audioEl()) return; // a replaced player's last event
   syncPlayer();
   const t = state.t;
   if (!t || !t.turns.length) return;
@@ -775,15 +824,15 @@ function liveLinesEls() {
   const sp = state.live.speakers || {};
   const lines = state.live.lines || [];
   if (!lines.length) return [el("p", { class: "empty-turns" }, "Listening… Lines appear a moment after each person finishes a sentence.")];
-  let prev = null;
-  return lines.map((line) => {
-    const cont = prev && prev.speaker === line.speaker;
-    prev = line;
-    return el("div", { class: `turn${cont ? " cont" : ""}`, "data-index": line.index, style: `--c:${color(line.speaker)}` },
-      el("div", { class: "gutter" }, el("span", { class: "time" }, fmt(line.start))),
-      el("div", {}, el("button", { class: "who", title: "Name this speaker", onclick: (e) => liveRename(e.currentTarget, line.speaker) }, (sp[line.speaker] || {}).name || line.speaker),
-        el("p", { class: "text", dir: "auto" }, ...(line.autofix ? highlight(line.text, line.autofix, "span", "fixed") : [line.text]))));
-  });
+  return lines.map((line, i) => liveLineEl(line, lines[i - 1], sp));
+}
+
+function liveLineEl(line, prev, sp = state.live.speakers || {}) {
+  const cont = prev && prev.speaker === line.speaker;
+  return el("div", { class: `turn${cont ? " cont" : ""}`, "data-index": line.index, style: `--c:${color(line.speaker)}` },
+    el("div", { class: "gutter" }, el("span", { class: "time" }, fmt(line.start))),
+    el("div", {}, el("button", { class: "who", title: "Name this speaker", onclick: (e) => liveRename(e.currentTarget, line.speaker) }, (sp[line.speaker] || {}).name || line.speaker),
+      el("p", { class: "text", dir: "auto" }, ...(line.autofix ? highlight(line.text, line.autofix, "span", "fixed") : [line.text]))));
 }
 
 function scrollLiveToEnd(force = false) {
@@ -829,7 +878,7 @@ function renderLiveStart() {
     try {
       state.live = await api("POST", "/api/live/start", { title: title.value.trim() || null, mic: mic.checked, system: sys.checked, apps: apps.value.trim() });
       renderList();
-      renderLive();
+      if (location.hash === "#/live") renderLive(); // the user may have opened another page while the model loaded
     } catch (err) { fail(err); btn.disabled = false; btn.replaceChildren(...startLabel()); }
   } }, startLabel());
   const source = (input, label, help) => el("label", { class: "check" }, input, el("span", { class: "check-text" }, el("span", {}, label), el("span", { class: "muted" }, help)));
@@ -929,6 +978,8 @@ async function renderSettings() {
   const sep = el("input", { type: "range", min: 0.5, max: 1.0, step: 0.05, value: s.speaker_threshold });
   const match = el("input", { type: "range", min: 0.3, max: 0.8, step: 0.05, value: s.voice_match_threshold });
   const prompt = el("input", { value: s.initial_prompt });
+  const speed = el("select", {}, [["accurate", "Most accurate"], ["fast", "Faster"]]
+    .map(([v, l]) => el("option", { value: v, selected: (s.speed || "accurate") === v }, l)));
   const setting = (label, help, control, stack = false) => el("label", { class: `setting${stack ? " stack" : ""}` },
     el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, label), help ? el("span", { class: "setting-help" }, help) : null), control);
   const scale = (input, left, right) => el("span", {}, input, el("span", { class: "range-ends", "aria-hidden": "true" }, el("span", {}, left), el("span", {}, right)));
@@ -938,6 +989,12 @@ async function renderSettings() {
     el("div", { class: "group" },
       setting("Your name", "Used for your microphone in live calls.", name),
       setting("Language spoken in calls", null, lang),
+      setting("Transcription speed", "Faster decodes greedily: about a quarter quicker. It drops most filler words like “um” and may word a few phrases differently.", speed),
+      el("div", { class: "setting" }, el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Neural Engine"),
+        el("span", { class: "setting-help" }, state.neuralEngine
+          ? "On: Whisper's encoder runs on the Mac's Neural Engine, about 1.7× faster than the GPU."
+          : "Off. On Apple Silicon, run ./whisper/build.sh in the Tadween folder to transcribe about 1.7× faster.")),
+        el("span", { class: `engine${state.neuralEngine ? " on" : ""}` }, state.neuralEngine ? "On" : "Off")),
       setting("Whisper style prompt", "A punctuated sentence Whisper imitates. Keep it short.", prompt),
       setting("CPU threads", "How many processor threads transcription uses.", threads)),
     el("h2", {}, "Voices"),
@@ -946,8 +1003,8 @@ async function renderSettings() {
       setting("Recognising saved voices", "How sure Tadween must be before it names someone from a saved voice.", scale(match, "Name people more eagerly", "Only when very sure"), true)),
     el("div", { class: "form-foot" }, el("button", { class: "primary", onclick: async () => {
       try {
-        state.settings = await api("PUT", "/api/settings", { my_name: name.value.trim() || "Me", language: lang.value, threads: Number(threads.value) || 6,
-          speaker_threshold: Number(sep.value), voice_match_threshold: Number(match.value), initial_prompt: prompt.value.trim() });
+        state.settings = await api("PUT", "/api/settings", { my_name: name.value.trim() || "Me", language: lang.value, threads: Number(threads.value) || 4,
+          speaker_threshold: Number(sep.value), voice_match_threshold: Number(match.value), initial_prompt: prompt.value.trim(), speed: speed.value });
         toast("Settings saved.");
       } catch (e) { fail(e); }
     } }, "Save settings"))));
@@ -972,14 +1029,21 @@ const handlers = {
   transcript: (m) => {
     if (state.t?.id !== m.id) return;
     clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(reloadTranscript, 250);
+    // An action here (Fix all, rename, merge…) already reloaded what this event announces.
+    reloadTimer = setTimeout(() => { if (Date.now() - state.reloadedAt > 1500) reloadTranscript(); }, 250);
   },
   live_started: async () => { state.live = await api("GET", "/api/live"); renderList(); if (location.hash === "#/live") renderLive(); },
   live_line: (m) => {
     if (!state.live.running || state.live.id !== m.id) return;
+    const prev = state.live.lines.at(-1);
+    const sameSpeakers = JSON.stringify(m.speakers) === JSON.stringify(state.live.speakers);
     state.live.lines.push(m.line);
     state.live.speakers = m.speakers;
-    refreshLive();
+    const box = $("#turns");
+    if (prev && sameSpeakers && box && location.hash === "#/live") { // the usual case: add just the new line
+      box.append(liveLineEl(m.line, prev));
+      scrollLiveToEnd();
+    } else refreshLive();
   },
   live_remove: (m) => { if (state.live.running) { state.live.lines = state.live.lines.filter((x) => x.index !== m.index); refreshLive(); } },
   live_speakers: (m) => { if (state.live.running) { state.live.speakers = m.speakers; refreshLive(); } },
@@ -995,16 +1059,31 @@ const handlers = {
 };
 
 function connectEvents() {
-  const es = new EventSource("/api/events");
-  let wasDown = false;
-  es.onmessage = (e) => { const m = JSON.parse(e.data); handlers[m.type]?.(m); };
-  es.onerror = () => { wasDown = true; };
-  es.onopen = async () => {
-    if (!wasDown) return;
-    wasDown = false;
-    await loadList().catch(() => {});
-    if (state.t) reloadTranscript().catch(() => {});
+  let es = null, wasDown = false, idle = null;
+  const open = () => {
+    es = new EventSource("/api/events");
+    es.onmessage = (e) => { const m = JSON.parse(e.data); handlers[m.type]?.(m); };
+    es.onerror = () => { wasDown = true; };
+    es.onopen = async () => {
+      if (!wasDown) return;
+      wasDown = false; // catch up on what was missed
+      const running = state.live.running;
+      state.live = await api("GET", "/api/live").catch(() => state.live);
+      if (location.hash === "#/live" && (running || state.live.running)) renderLive();
+      await loadList().catch(() => {});
+      if (state.t) reloadTranscript().catch(() => {});
+    };
   };
+  // A browser gives all tabs together only 6 connections per host, and each event stream holds one for good,
+  // so a tab left in the background for a minute closes its stream and catches up when it's shown again.
+  const onVisibility = () => {
+    clearTimeout(idle);
+    if (!document.hidden) { if (!es) open(); }
+    else idle = setTimeout(() => { es?.close(); es = null; wasDown = true; }, 60000);
+  };
+  document.addEventListener("visibilitychange", onVisibility);
+  open();
+  onVisibility();
 }
 
 setInterval(tickClocks, 1000);
@@ -1016,6 +1095,7 @@ setInterval(tickClocks, 1000);
     state.settings = s.settings;
     state.live = s.live;
     state.capture = s.capture_helper;
+    state.neuralEngine = s.neural_engine;
     connectEvents();
     await loadList();
     addEventListener("hashchange", route);

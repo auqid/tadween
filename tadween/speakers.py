@@ -66,7 +66,7 @@ def embed_windows(x, wins, progress=None):
             progress(i / max(len(wins), 1))
     if progress:
         progress(1.0)
-    return np.array(out, dtype=np.float32).reshape(len(out), -1)
+    return np.array(out, dtype=np.float32).reshape(len(out), embed.ext.dim)  # (0, dim) when there's no speech
 
 
 def unit(v):
@@ -112,17 +112,19 @@ def cluster(E, spans, num_speakers=None, threshold=0.8, min_seconds=None, switch
     if min_seconds is None:
         min_seconds = min(20.0, max(8.0, 0.005 * talk_time.sum()))
 
-    def big(labels):
+    def big(labels, floor=min_seconds):
         talk = Counter()
         for lab, d in zip(labels, talk_time):
             talk[lab] += d
-        return [lab for lab, t in talk.most_common() if t >= min_seconds]
+        return [lab for lab, t in talk.most_common() if t >= floor]
 
     if num_speakers:
-        # Tiny outlier groups don't count as speakers: cut finer until enough real ones appear.
-        for k in range(num_speakers, num_speakers + 20):
-            labels = fcluster(Z, k, criterion="maxclust")
-            keep = big(labels)
+        # Tiny outlier groups don't count as speakers: cut finer until enough real ones appear. A short
+        # recording may not hold min_seconds for everyone: then a third of an even share will do, and
+        # failing that, take the cut that found the most.
+        cuts = [fcluster(Z, k, criterion="maxclust") for k in range(num_speakers, num_speakers + 20)]
+        for floor in (min_seconds, min(min_seconds, talk_time.sum() / (3 * num_speakers))):
+            labels, keep = max(((c, big(c, floor)) for c in cuts), key=lambda cut: min(len(cut[1]), num_speakers))
             if len(keep) >= num_speakers:
                 break
         keep = keep[:num_speakers]
@@ -181,6 +183,10 @@ class VoiceBank:
 
     def __init__(self):
         self.file = config.DATA / "people.json"
+        self._load()
+
+    def _load(self):
+        """Changes re-read the file under the lock: another VoiceBank may have saved since this one read it."""
         self.people = config.read_json(self.file, {"people": []})["people"]
 
     def _save(self):
@@ -212,7 +218,7 @@ class VoiceBank:
 
     def enroll(self, name, vec):
         with self._lock:
-            self.people = config.read_json(self.file, {"people": []})["people"]
+            self._load()
             person = next((p for p in self.people if p["name"].lower() == name.lower()), None)
             if person is None:
                 person = {"id": uuid.uuid4().hex[:10], "name": name, "samples": [], "updated": 0}
@@ -224,6 +230,7 @@ class VoiceBank:
 
     def rename(self, pid, name):
         with self._lock:
+            self._load()
             for p in self.people:
                 if p["id"] == pid:
                     p["name"] = name
@@ -231,5 +238,6 @@ class VoiceBank:
 
     def delete(self, pid):
         with self._lock:
+            self._load()
             self.people = [p for p in self.people if p["id"] != pid]
             self._save()
