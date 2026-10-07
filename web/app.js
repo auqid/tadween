@@ -289,7 +289,7 @@ function textEl(turn, editable = true) {
   else if (!turn.edited && !turn.autofix && turn.words?.length) {
     turn.words.forEach((w, i) => {
       const txt = i === 0 ? w.w.trimStart() : w.w;
-      p.append(w.p < 0.4 && /[a-z0-9]/i.test(w.w)
+      p.append(w.p < 0.25 && w.w.replace(/[^a-z0-9]/gi, "").length >= 3
         ? el("span", { class: "unsure", title: `Whisper wasn't sure about this word (${Math.round(w.p * 100)}%). Click to fix.` }, txt)
         : txt);
     });
@@ -657,7 +657,7 @@ function renderLiveStart() {
     go,
     el("div", { class: "note" },
       el("b", {}, "First time? "), "macOS will ask for Microphone and Screen & System Audio Recording permission for the app that runs Tadween (Terminal or VS Code). Allow both, then quit and reopen that app. ",
-      "Headphones give the cleanest result. When you press Stop, Tadween re-checks every voice over the whole call for the final labels.")));
+      "Headphones give the cleanest result. When you press Stop, Tadween transcribes the whole call again with full context and regroups the voices for the final version.")));
 }
 
 // ---------- library pages ----------

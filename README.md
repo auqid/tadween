@@ -7,7 +7,7 @@ Tadween transcribes Zoom, Meet, Teams or any other calls, live or from a recordi
 ## What it does
 
 - **Transcribe recordings.** Drop in an `.m4a`, `.mp3`, `.mp4`, `.mov` or `.wav` file. It gets a timestamped transcript split into speaker turns.
-- **Live calls.** Your microphone is labelled as you, and the Mac's sound output (everyone else) is split by voice as people talk. When you stop, the whole call is re-analysed for final labels. This works with any meeting app, because it captures audio rather than reading a web page.
+- **Live calls.** Your microphone is labelled as you, and the Mac's sound output (everyone else) is split by voice as people talk. When you stop, the whole call is transcribed again with full context and the voices are regrouped, so the saved transcript is as good as a recording's. This works with any meeting app, because it captures audio rather than reading a web page.
 - **Names that stick.** Click *Speaker 3*, type "Sara", and keep "remember this voice" ticked. Tadween stores a voiceprint (a vector describing the voice, not audio) and labels Sara automatically in later calls.
 - **Fix once, fixed everywhere.** Edit a word, or select it and click *Fix everywhere*. Tadween shows how often it occurs and replaces every occurrence. Remembered fixes are applied to future transcripts and also passed to Whisper, so it spells the word correctly to begin with.
 - **Easy cleanup:**
@@ -72,7 +72,7 @@ Delete a transcript in the app, or delete the folder, to remove it completely.
 
 - **Speaker separation depends on the audio.** One phone recording a room is the hardest case. Live capture of the call audio is much cleaner. If Tadween splits one person into two, merge them. If it lumps people together, set the number of people.
 - **Live lines appear in bursts.** Each line shows up a moment after a person pauses, not word by word.
-- **Live speaker labels are provisional.** The final labels arrive a minute or so after you press Stop.
+- **Live text and labels are a draft.** The final transcript is ready a few minutes after you press Stop, about one seventh of the call's length.
 - **Settings default to English.** For other languages, change the language in Settings.
 
 ## Project layout
