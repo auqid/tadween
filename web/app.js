@@ -992,6 +992,11 @@ function renamePerson(anchor, p) {
   name.select();
 }
 
+/** A settings row that shows (not sets) where Whisper runs. */
+const engine = (label, help, on, value) => el("div", { class: "setting" },
+  el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, label), el("span", { class: "setting-help" }, help)),
+  el("span", { class: `engine${on ? " on" : ""}` }, value));
+
 async function renderSettings() {
   let s;
   try { s = await api("GET", "/api/settings"); } catch (e) { return fail(e); }
@@ -1014,13 +1019,20 @@ async function renderSettings() {
       setting("Your name", "Used for your microphone in live calls.", name),
       setting("Language spoken in calls", null, lang),
       setting("Transcription speed", `Faster decodes greedily: ${mac() ? "about a quarter quicker" : "quicker with an NVIDIA GPU, but no quicker on a CPU alone"}. It drops most filler words like “um” and may word a few phrases differently.`, speed),
-      !mac() ? null : el("div", { class: "setting" }, el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Neural Engine"),
-        el("span", { class: "setting-help" }, state.neuralEngine
+      mac()
+        ? engine("Neural Engine", state.neuralEngine
           ? "On: Whisper's encoder runs on the Mac's Neural Engine, about 1.7× faster than the GPU on an M1."
           : state.neuralEngineInstalled
             ? "Off: turned off with TADWEEN_NEURAL_ENGINE=0, so Whisper runs on the GPU."
-            : "Off. On Apple Silicon, run ./whisper/build.sh in the Tadween folder to transcribe about 1.7× faster.")),
-        el("span", { class: `engine${state.neuralEngine ? " on" : ""}` }, state.neuralEngine ? "On" : "Off")),
+            : "Off. On Apple Silicon, run ./whisper/build.sh in the Tadween folder to transcribe about 1.7× faster.",
+        state.neuralEngine, state.neuralEngine ? "On" : "Off")
+        : engine("Whisper runs on", {
+          cuda: "The NVIDIA GPU, with the CUDA build of whisper.cpp.",
+          cpu: state.platform === "windows"
+            ? "The CPU. For an NVIDIA GPU, update its driver, delete the whisper\\bin folder and run setup.ps1 again."
+            : "The CPU. For an NVIDIA GPU, install the CUDA toolkit and run ./whisper/build.sh again.",
+        }[state.whisperBuild] || "The whisper.cpp on your PATH, so Tadween can't tell whether it uses a GPU.",
+        state.whisperBuild === "cuda", { cuda: "GPU", cpu: "CPU" }[state.whisperBuild] || "Your own"),
       setting("Whisper style prompt", "A punctuated sentence Whisper imitates. Keep it short.", prompt),
       setting("CPU threads", "For Whisper and voice recognition. Use the number of performance cores this computer has; restart Tadween after changing it.", threads)),
     el("h2", {}, "Voices"),
@@ -1122,6 +1134,7 @@ setInterval(tickClocks, 1000);
     state.live = s.live;
     state.capture = s.capture_helper;
     state.platform = s.platform;
+    state.whisperBuild = s.whisper_build;
     state.neuralEngine = s.neural_engine;
     state.neuralEngineInstalled = s.neural_engine_installed;
     connectEvents();

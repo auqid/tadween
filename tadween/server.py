@@ -144,7 +144,7 @@ class Handler(BaseHTTPRequestHandler):
 def state(h):
     return {"settings": config.load_settings(), "live": live.status(),
             "capture_helper": live.capture_available(), "platform": config.PLATFORM,
-            "neural_engine": config.neural_engine(),
+            "whisper_build": config.whisper_build(), "neural_engine": config.neural_engine(),
             "neural_engine_installed": config.neural_engine_installed()}
 
 

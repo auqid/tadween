@@ -80,6 +80,15 @@ def neural_engine():
     return os.environ.get("TADWEEN_NEURAL_ENGINE") != "0" and neural_engine_installed()
 
 
+def whisper_build():
+    """What setup put in whisper/bin: "cuda", "cpu" or "coreml" (None if nothing, e.g. Homebrew's on a Mac)."""
+    try:
+        version = (WHISPER_BIN / "VERSION").read_text(encoding="utf-8").lower()
+    except OSError:
+        return None
+    return "cuda" if "cuda" in version else "coreml" if "coreml" in version else "cpu"
+
+
 def whisper_tool(name):
     """whisper-cli or whisper-server: our own build in whisper/bin, or else the one on PATH (Homebrew's on a Mac).
     On a Mac whisper/bin holds the Core ML build, which is skipped when the Neural Engine is turned off."""

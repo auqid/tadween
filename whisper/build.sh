@@ -13,26 +13,36 @@ MODELS=../models
 MODEL=$MODELS/ggml-large-v3-turbo-q8_0.bin
 ENCODER=$MODELS/ggml-large-v3-turbo-encoder.mlmodelc  # whisper.cpp finds it next to the model
 
-build() {  # flavor cmake-options...
+build() {  # flavor cmake-options...  Fails (non-zero) if any step does, even where set -e is off.
   local flavor=$1; shift
   if [ "$(cat bin/VERSION 2>/dev/null)" = "$VERSION $flavor" ] && [ -x bin/whisper-cli ] && [ -x bin/whisper-server ]; then
     return 0
   fi
-  echo "    Building whisper.cpp $VERSION ($flavor, a few minutes)"
+  echo "    Building whisper.cpp $VERSION ($flavor, a few minutes$([ "$flavor" = cuda ] && echo ' - CUDA takes longest'))"
   rm -rf src
-  git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$VERSION" https://github.com/ggml-org/whisper.cpp.git src
-  cmake -S src -B src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF "$@" >/dev/null
-  cmake --build src/build -j "$(getconf _NPROCESSORS_ONLN)" --config Release --target whisper-cli whisper-server >/dev/null
-  mkdir -p bin
-  cp src/build/bin/whisper-cli src/build/bin/whisper-server bin/
-  echo "$VERSION $flavor" > bin/VERSION
-  rm -rf src
+  git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$VERSION" https://github.com/ggml-org/whisper.cpp.git src &&
+    cmake -S src -B src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF "$@" >/dev/null &&
+    cmake --build src/build -j "$(getconf _NPROCESSORS_ONLN)" --config Release --target whisper-cli whisper-server >/dev/null &&
+    mkdir -p bin &&
+    cp src/build/bin/whisper-cli src/build/bin/whisper-server bin/ &&
+    echo "$VERSION $flavor" > bin/VERSION &&
+    rm -rf src
 }
 
 if [ "$(uname -s)" = "Linux" ]; then
-  if command -v nvcc >/dev/null 2>&1 && command -v nvidia-smi >/dev/null 2>&1; then
-    build cuda -DGGML_CUDA=1
+  if ! command -v nvcc >/dev/null 2>&1 && [ -x /usr/local/cuda/bin/nvcc ]; then
+    PATH="/usr/local/cuda/bin:$PATH"  # where NVIDIA's own installer puts the CUDA toolkit, off PATH
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1 && command -v nvcc >/dev/null 2>&1; then
+    if ! build cuda -DGGML_CUDA=1; then
+      echo "    The CUDA build failed, so Whisper will use the CPU for now (the errors are above)." >&2
+      build cpu
+    fi
   else
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      echo "    There's an NVIDIA GPU but no CUDA toolkit (nvcc), so Whisper will use the CPU. To use the GPU, install"
+      echo "    the toolkit (Ubuntu: sudo apt install nvidia-cuda-toolkit), then run ./whisper/build.sh again."
+    fi
     build cpu
   fi
   echo "Built $(pwd)/bin (whisper.cpp $VERSION, $(cut -d' ' -f2 bin/VERSION))"
