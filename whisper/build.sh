@@ -1,8 +1,10 @@
 #!/bin/bash
-# Builds whisper.cpp with Core ML so Whisper's encoder runs on the Apple Neural Engine instead of the GPU.
-# Measured on an M1: recordings transcribe about 1.7x faster with the same text, and live lines appear in
-# about 1.4 s instead of 3.6 s. Optional - without it Tadween uses Homebrew's whisper-cpp.
-# Needs the Command Line Tools and cmake; works from any working directory; safe to run again.
+# Builds whisper.cpp for this computer into whisper/bin.
+#  - Apple Silicon Mac: with Core ML, so Whisper's encoder runs on the Neural Engine instead of the GPU.
+#    Measured on an M1: recordings transcribe about 1.7x faster with the same text, and live lines appear in
+#    about 1.4 s instead of 3.6 s. Optional - without it Tadween uses Homebrew's whisper-cpp.
+#  - Linux: with CUDA when an NVIDIA GPU and the CUDA toolkit are present, otherwise for the CPU.
+# Needs git, cmake and a C++ compiler; works from any working directory; safe to run again.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
@@ -11,24 +13,49 @@ MODELS=../models
 MODEL=$MODELS/ggml-large-v3-turbo-q8_0.bin
 ENCODER=$MODELS/ggml-large-v3-turbo-encoder.mlmodelc  # whisper.cpp finds it next to the model
 
+build() {  # flavor cmake-options...  Fails (non-zero) if any step does, even where set -e is off.
+  local flavor=$1; shift
+  if [ "$(cat bin/VERSION 2>/dev/null)" = "$VERSION $flavor" ] && [ -x bin/whisper-cli ] && [ -x bin/whisper-server ]; then
+    return 0
+  fi
+  echo "    Building whisper.cpp $VERSION ($flavor, a few minutes$([ "$flavor" = cuda ] && echo ' - CUDA takes longest'))"
+  rm -rf src
+  git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$VERSION" https://github.com/ggml-org/whisper.cpp.git src &&
+    cmake -S src -B src/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF "$@" >/dev/null &&
+    cmake --build src/build -j "$(getconf _NPROCESSORS_ONLN)" --config Release --target whisper-cli whisper-server >/dev/null &&
+    mkdir -p bin &&
+    cp src/build/bin/whisper-cli src/build/bin/whisper-server bin/ &&
+    echo "$VERSION $flavor" > bin/VERSION &&
+    rm -rf src
+}
+
+if [ "$(uname -s)" = "Linux" ]; then
+  if ! command -v nvcc >/dev/null 2>&1 && [ -x /usr/local/cuda/bin/nvcc ]; then
+    PATH="/usr/local/cuda/bin:$PATH"  # where NVIDIA's own installer puts the CUDA toolkit, off PATH
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1 && command -v nvcc >/dev/null 2>&1; then
+    if ! build cuda -DGGML_CUDA=1; then
+      echo "    The CUDA build failed, so Whisper will use the CPU for now (the errors are above)." >&2
+      build cpu
+    fi
+  else
+    if command -v nvidia-smi >/dev/null 2>&1; then
+      echo "    There's an NVIDIA GPU but no CUDA toolkit (nvcc), so Whisper will use the CPU. To use the GPU, install"
+      echo "    the toolkit (Ubuntu: sudo apt install nvidia-cuda-toolkit), then run ./whisper/build.sh again."
+    fi
+    build cpu
+  fi
+  echo "Built $(pwd)/bin (whisper.cpp $VERSION, $(cut -d' ' -f2 bin/VERSION))"
+  exit 0
+fi
+
 if [ "$(uname -m)" != "arm64" ]; then
   echo "    Skipped - the Neural Engine needs an Apple Silicon Mac"
   exit 0
 fi
 
-if [ "$(cat bin/VERSION 2>/dev/null)" != "$VERSION" ] || [ ! -x bin/whisper-cli ] || [ ! -x bin/whisper-server ]; then
-  command -v cmake >/dev/null 2>&1 || brew install cmake
-  echo "    Building whisper.cpp $VERSION with Core ML (a few minutes)"
-  rm -rf src
-  git clone --quiet --depth 1 --branch "$VERSION" https://github.com/ggml-org/whisper.cpp.git src
-  cmake -S src -B src/build -DCMAKE_BUILD_TYPE=Release -DWHISPER_COREML=1 -DWHISPER_COREML_ALLOW_FALLBACK=1 \
-    -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF -DGGML_METAL_EMBED_LIBRARY=ON >/dev/null
-  cmake --build src/build -j "$(sysctl -n hw.ncpu)" --config Release --target whisper-cli whisper-server >/dev/null
-  mkdir -p bin
-  cp src/build/bin/whisper-cli src/build/bin/whisper-server bin/
-  echo "$VERSION" > bin/VERSION
-  rm -rf src
-fi
+command -v cmake >/dev/null 2>&1 || brew install cmake
+build coreml -DWHISPER_COREML=1 -DWHISPER_COREML_ALLOW_FALLBACK=1 -DGGML_METAL_EMBED_LIBRARY=ON
 
 if [ ! -d "$ENCODER" ]; then
   echo "    Downloading the Neural Engine encoder (1.2 GB)"

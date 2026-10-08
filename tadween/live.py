@@ -3,8 +3,12 @@
 Your mic is always you. Everything else (the call) comes from system audio and is grouped by
 voice as it arrives. When the call ends, the full voice analysis runs once more for final labels.
 """
+import bisect
+import importlib.util
+import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -14,9 +18,27 @@ import numpy as np
 from . import asr, audio, config, events, pipeline, speakers, store, vad, vocab
 
 SR = config.SAMPLE_RATE
+# A computer without a GPU can fall behind, as Whisper takes as long for a short snippet as for 30 s. Then the
+# snippets waiting go to Whisper together: up to PACK seconds of them, PACK_GAP seconds of silence apart, so
+# each word can be traced back to the snippet it was said in.
+PACK = 25.0
+PACK_GAP = 1.0
 _session = None
 _lock = threading.Lock()
 
+
+def capture_available():
+    """The macOS helper is built by setup.sh; elsewhere tadween/capture.py needs the soundcard package."""
+    if config.PLATFORM == "mac":
+        return config.CAPTURE_BIN.exists()
+    return importlib.util.find_spec("soundcard") is not None
+
+
+def capture_command(source, apps=""):
+    """How to record one source as 16 kHz PCM. Only the macOS helper can limit capture to some apps."""
+    if config.PLATFORM == "mac":
+        return [str(config.CAPTURE_BIN), source] + (["--apps", apps] if source == "system" and apps else [])
+    return [sys.executable, "-m", "tadween.capture", source]
 
 
 class Source(threading.Thread):
@@ -48,7 +70,8 @@ class Source(threading.Thread):
             self.raw.close()
 
     def _from_helper(self):
-        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = {**os.environ, "PYTHONPATH": str(config.ROOT)}  # so the Python helper finds the tadween package
+        self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         threading.Thread(target=self._read_logs, daemon=True).start()
         asked = time.monotonic()
         while chunk := self.proc.stdout.read(3200):  # 0.1 s of 16 kHz s16le
@@ -108,8 +131,10 @@ class Source(threading.Thread):
 
 class LiveSession:
     def __init__(self, title, mic=True, system=True, apps="", simulate=None, speed=1.0):
-        if not simulate and not config.CAPTURE_BIN.exists():
-            raise RuntimeError("The capture helper isn't built yet. Run ./setup.sh (or capture/build.sh).")
+        if not simulate and not capture_available():
+            raise RuntimeError({"mac": "The capture helper isn't built yet. Run ./setup.sh (or capture/build.sh).",
+                                "windows": "Live calls need the soundcard package. Run setup.ps1 again.",
+                                "linux": "Live calls need the soundcard package. Run ./setup.sh again."}[config.PLATFORM])
         if not (mic or system or simulate):
             raise ValueError("Pick at least one audio source.")
         self.settings = config.load_settings()
@@ -123,15 +148,14 @@ class LiveSession:
         self.stopping = self.running = False
         self.stop_lock = threading.Lock()
         self.next_label = 1
-        bin_ = str(config.CAPTURE_BIN)
         self.sources = []
         if simulate:
             self.sources.append(Source(self, "system", simulate=simulate, speed=speed))
         else:
             if mic:
-                self.sources.append(Source(self, "mic", [bin_, "mic"]))
+                self.sources.append(Source(self, "mic", capture_command("mic")))
             if system:
-                self.sources.append(Source(self, "system", [bin_, "system"] + (["--apps", apps] if apps else [])))
+                self.sources.append(Source(self, "system", capture_command("system", apps)))
         if any(s.name == "mic" for s in self.sources):
             self.speakers["ME"] = {"label": "ME", "name": self.settings["my_name"], "manual": True}
 
@@ -157,13 +181,29 @@ class LiveSession:
             self.queue.put((source, start, x))
 
     def _work(self):
-        while (item := self.queue.get()) is not None:
-            if self.stopping:  # the final pass transcribes the whole call again: don't make Stop wait on a backlog
-                continue
-            try:
-                self._transcribe(*item)
-            except Exception as e:
-                events.emit("live_error", source=item[0], message=str(e))
+        while True:
+            items = [self.queue.get()]
+            while not self.queue.empty():  # fell behind: catch up with fewer, fuller Whisper runs
+                items.append(self.queue.get_nowait())
+            if any(item is None for item in items):
+                return
+            packs = sorted(_packs(items), key=lambda pack: pack[0][1])
+            heard = []
+            for i, pack in enumerate(packs):
+                if self.stopping:  # the final pass transcribes the whole call again: don't make Stop wait on a backlog
+                    break
+                try:
+                    heard += self._transcribe(pack)
+                except Exception as e:
+                    if not self.stopping:  # Stop closes the server under a slow snippet on purpose
+                        events.emit("live_error", source=pack[0][0], message=str(e))
+                # Show lines as soon as no pack still to come can hold an earlier one: the view lists them in order.
+                upto = packs[i + 1][0][1] if i + 1 < len(packs) else float("inf")
+                heard.sort(key=lambda lx: lx[0]["start"])
+                while heard and heard[0][0]["start"] < upto:
+                    self._add_safely(*heard.pop(0))
+            for line, x in heard:  # stopped part way
+                self._add_safely(line, x)
 
     def _new_label(self):
         label = f"S{self.next_label}"
@@ -171,17 +211,40 @@ class LiveSession:
         self.speakers[label] = {"label": label, "name": f"Speaker {label[1:]}", "manual": False}
         return label
 
-    def _transcribe(self, source, start, x):
+    def _transcribe(self, pack):
+        """Snippets [(source, start, x)] of one source, in one Whisper run -> [(line, x)] for those with words."""
+        gap = np.zeros(int(PACK_GAP * SR), np.float32)
+        joined = np.concatenate([piece for _, _, x in pack for piece in (x, gap)][:-1])
+        offsets, t = [], 0.0  # where each snippet starts in the joined audio
+        for _, _, x in pack:
+            offsets.append(t)
+            t += len(x) / SR + PACK_GAP
         context = " ".join(line["text"] for line in self.lines[-2:])[-200:]
-        segs = self.server.transcribe(x, f"{self.prompt} {context}".strip())
-        if not segs:
-            return
-        words = []
-        for s in segs:
+        words = [[] for _ in pack]
+        for s in self.server.transcribe(joined, f"{self.prompt} {context}".strip()):
             for w in s["words"] or [{"w": " " + s["text"], "s": s["start"], "e": s["end"], "p": 1.0}]:
-                words.append({**w, "s": round(start + w["s"], 2), "e": round(start + w["e"], 2)})
-        line = {"start": round(start, 2), "end": round(start + len(x) / SR, 2), "source": source,
-                "text": " ".join(s["text"] for s in segs).strip(), "words": words}
+                # the snippet it was said in: the gaps' midpoints are the borders
+                i = max(0, bisect.bisect_right(offsets, (w["s"] + w["e"]) / 2 + PACK_GAP / 2) - 1)
+                words[i].append(w)
+        heard = []
+        for (source, start, x), offset, ws in zip(pack, offsets, words):
+            if not ws:
+                continue
+            length = len(x) / SR
+            ws = [{**w, "s": round(start + min(max(w["s"] - offset, 0.0), length), 2),
+                   "e": round(start + min(max(w["e"] - offset, 0.0), length), 2)} for w in ws]
+            heard.append(({"start": round(start, 2), "end": round(start + length, 2), "source": source,
+                           "text": "".join(w["w"] for w in ws).strip(), "words": ws}, x))
+        return heard
+
+    def _add_safely(self, line, x):
+        try:
+            self._add(line, x)
+        except Exception as e:
+            events.emit("live_error", source=line["source"], message=str(e))
+
+    def _add(self, line, x):
+        source = line["source"]
         if source == "mic":
             if self._echo_of_call(line):
                 return
@@ -255,8 +318,9 @@ class LiveSession:
             for s in self.sources:
                 s.join(timeout=15)
             self.queue.put(None)
-            self.worker.join(timeout=300)
-            self.server.close()
+            self.worker.join(timeout=5)  # the line being transcribed, when that's quick (a GPU or the Neural Engine)
+            self.server.close()  # a slow one fails at once: the final pass transcribes everything again anyway
+            self.worker.join(timeout=30)
             self.running = False
             try:
                 self._save()
@@ -276,6 +340,22 @@ class LiveSession:
         store.update(self.id, status="queued", duration=round(length / SR, 2), speakers=self.speakers,
                      turns=[{**_public(ln), "id": i + 1} for i, ln in enumerate(lines)])
         pipeline.enqueue(self.id)
+
+
+def _packs(items):
+    """Queued snippets [(source, start, x)] -> runs of one source that fit in one Whisper window."""
+    packs = []
+    for source in dict.fromkeys(item[0] for item in items):
+        pack, length = [], 0.0
+        for item in (it for it in items if it[0] == source):
+            seconds = len(item[2]) / SR
+            if pack and length + PACK_GAP + seconds > PACK:
+                packs.append(pack)
+                pack, length = [], 0.0
+            length += (PACK_GAP if pack else 0.0) + seconds
+            pack.append(item)
+        packs.append(pack)
+    return packs
 
 
 def _public(line):

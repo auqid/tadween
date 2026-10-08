@@ -13,6 +13,9 @@ from . import config, edits, events, live, pipeline, speakers, store, vocab
 
 ROUTES = []
 TID = r"([a-z0-9-]+)"
+# Not from mimetypes alone: on Windows it reads the registry, where .js is sometimes text/plain - a script
+# browsers refuse to run.
+WEB_TYPES = {".html": "text/html", ".css": "text/css", ".js": "text/javascript"}
 
 
 def route(method, pattern):
@@ -101,7 +104,7 @@ class Handler(BaseHTTPRequestHandler):
         f = (config.WEB / ("index.html" if path in ("", "/") else path.lstrip("/"))).resolve()
         if config.WEB.resolve() not in f.parents or not f.is_file():
             return self.send_json({"error": "Not found"}, 404)
-        ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
+        ctype = WEB_TYPES.get(f.suffix) or mimetypes.guess_type(f.name)[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
         self.send_bytes(f.read_bytes(), ctype)
@@ -140,7 +143,9 @@ class Handler(BaseHTTPRequestHandler):
 @route("GET", "/api/state")
 def state(h):
     return {"settings": config.load_settings(), "live": live.status(),
-            "capture_helper": config.CAPTURE_BIN.exists(), "neural_engine": config.neural_engine()}
+            "capture_helper": live.capture_available(), "platform": config.PLATFORM,
+            "whisper_build": config.whisper_build(), "neural_engine": config.neural_engine(),
+            "neural_engine_installed": config.neural_engine_installed()}
 
 
 @route("GET", "/api/events")

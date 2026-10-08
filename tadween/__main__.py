@@ -4,8 +4,14 @@ import sys
 from pathlib import Path
 
 
+_shown = 0  # length of the progress line on screen
+
+
 def _print_progress(stage, fraction):
-    print(f"\r\033[K{stage}", end="", file=sys.stderr, flush=True)
+    global _shown
+    # Spaces over the rest of the last message: Windows 10's console doesn't understand "clear line" codes.
+    print(f"\r{stage}{' ' * (_shown - len(stage))}", end="", file=sys.stderr, flush=True)
+    _shown = len(stage)
 
 
 def main():
@@ -18,6 +24,8 @@ def main():
     one.add_argument("file")
     one.add_argument("--speakers", type=int, help="how many people talk (default: detect)")
     one.add_argument("--format", default="txt", choices=["txt", "md", "srt", "vtt"])
+    if len(sys.argv) == 1 or sys.argv[1].startswith("-") and sys.argv[1] not in ("-h", "--help"):
+        sys.argv.insert(1, "serve")  # `tadween --port 8766` means the app
     args = parser.parse_args()
 
     if args.cmd == "serve":
@@ -48,7 +56,8 @@ def main():
     out = src.with_name(f"{src.stem} - transcript.{args.format}")
     out.write_text(text, encoding="utf-8")
     names = ", ".join(s["name"] for s in t["speakers"].values())
-    print(f"{len(t['turns'])} lines, speakers: {names}\nSaved {out}\nOpen the app to name speakers and fix words: ./tadween.sh")
+    app = r".\tadween.cmd" if sys.platform == "win32" else "./tadween.sh"
+    print(f"{len(t['turns'])} lines, speakers: {names}\nSaved {out}\nOpen the app to name speakers and fix words: {app}")
 
 
 if __name__ == "__main__":

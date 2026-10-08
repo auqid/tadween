@@ -1,3 +1,4 @@
 sherpa-onnx>=1.12
 numpy>=1.26
 scipy>=1.11
+soundcard>=0.4.4; sys_platform != "darwin"  # live-call capture on Windows and Linux

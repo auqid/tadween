@@ -94,7 +94,7 @@ def _run_cli(wav, out_base, prompt, settings, progress, fresh_context):
     if proc.wait() != 0 or not out.exists():  # it exits 0 with no output when it can't read the audio
         raise RuntimeError("whisper-cli failed:\n" + "".join(tail))
     result = json.loads(out.read_text(encoding="utf-8", errors="replace"))
-    out.unlink(missing_ok=True)
+    config.remove(out)
     return result
 
 
@@ -145,7 +145,7 @@ def transcribe(timeline, workdir, prompt, settings, progress=None, fresh_context
     try:
         result = _run_cli(wav, workdir / name, prompt, settings, progress, fresh_context)
     finally:
-        wav.unlink(missing_ok=True)
+        config.remove(wav)
     return parse(result, timeline)
 
 
