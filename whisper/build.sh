@@ -3,15 +3,23 @@
 #  - Apple Silicon Mac: with Core ML, so Whisper's encoder runs on the Neural Engine instead of the GPU.
 #    Measured on an M1: recordings transcribe about 1.7x faster with the same text, and live lines appear in
 #    about 1.4 s instead of 3.6 s. Optional - without it Tadween uses Homebrew's whisper-cpp.
-#  - Linux: with CUDA when an NVIDIA GPU and the CUDA toolkit are present, otherwise for the CPU.
+#  - Linux: with CUDA for an NVIDIA GPU (needs the CUDA toolkit), with Vulkan for an AMD or Intel GPU (needs the
+#    Vulkan build tools), otherwise for the CPU.
+#    To choose yourself: ./whisper/build.sh cuda|vulkan|cpu
 # Needs git, cmake and a C++ compiler; works from any working directory; safe to run again.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-VERSION=v1.9.4
+VERSION=$(sed -n 's/^TAG=//p' RELEASE | tr -d '\r')  # the release every platform uses
 MODELS=../models
 MODEL=$MODELS/ggml-large-v3-turbo-q8_0.bin
 ENCODER=$MODELS/ggml-large-v3-turbo-encoder.mlmodelc  # whisper.cpp finds it next to the model
+
+speed_check() {  # time Whisper on this computer's engines (tadween/speed.py), once per build
+  if [ -x ../.venv/bin/python ] && [ -s "$MODEL" ]; then
+    (cd .. && PYTHONPATH=. .venv/bin/python -m tadween speed-check --if-needed)
+  fi
+}
 
 build() {  # flavor cmake-options...  Fails (non-zero) if any step does, even where set -e is off.
   local flavor=$1; shift
@@ -30,22 +38,53 @@ build() {  # flavor cmake-options...  Fails (non-zero) if any step does, even wh
 }
 
 if [ "$(uname -s)" = "Linux" ]; then
-  if ! command -v nvcc >/dev/null 2>&1 && [ -x /usr/local/cuda/bin/nvcc ]; then
+  has() { command -v "$1" >/dev/null 2>&1; }
+  gpu_from() { grep -qix "$1" /sys/class/drm/card*/device/vendor 2>/dev/null; }  # PCI vendor id of a GPU in use
+  vulkan_tools() { has glslc && [ -f /usr/include/vulkan/vulkan.h ] && [ -d /usr/include/spirv ]; }
+  if ! has nvcc && [ -x /usr/local/cuda/bin/nvcc ]; then
     PATH="/usr/local/cuda/bin:$PATH"  # where NVIDIA's own installer puts the CUDA toolkit, off PATH
   fi
-  if command -v nvidia-smi >/dev/null 2>&1 && command -v nvcc >/dev/null 2>&1; then
-    if ! build cuda -DGGML_CUDA=1; then
-      echo "    The CUDA build failed, so Whisper will use the CPU for now (the errors are above)." >&2
-      build cpu
+
+  flavor=${1:-}
+  if [ -z "$flavor" ]; then
+    if has nvidia-smi && has nvcc; then
+      flavor=cuda
+    elif { has nvidia-smi || gpu_from 0x1002 || gpu_from 0x8086; } && vulkan_tools; then  # NVIDIA, AMD, Intel
+      flavor=vulkan
+      if has nvidia-smi; then
+        echo "    Using the NVIDIA GPU through Vulkan. CUDA is faster: install the CUDA toolkit"
+        echo "    (Ubuntu: sudo apt install nvidia-cuda-toolkit), then run ./whisper/build.sh again."
+      fi
+    else
+      flavor=cpu
+      if has nvidia-smi || gpu_from 0x1002 || gpu_from 0x8086; then
+        echo "    There's a GPU, but not the tools to build for it, so Whisper will use the CPU. To use the GPU:"
+        if has nvidia-smi; then
+          echo "      NVIDIA: install the CUDA toolkit (Ubuntu: sudo apt install nvidia-cuda-toolkit)"
+        else
+          echo "      AMD or Intel: install the Vulkan build tools and driver"
+          echo "        Ubuntu/Debian: sudo apt install libvulkan-dev glslc spirv-headers mesa-vulkan-drivers"
+          echo "        Fedora: sudo dnf install vulkan-loader-devel glslc spirv-headers-devel mesa-vulkan-drivers"
+          echo "        Arch: sudo pacman -S vulkan-headers vulkan-icd-loader shaderc spirv-headers vulkan-radeon (AMD) or vulkan-intel"
+        fi
+        echo "    then run ./whisper/build.sh again."
+      fi
     fi
-  else
-    if command -v nvidia-smi >/dev/null 2>&1; then
-      echo "    There's an NVIDIA GPU but no CUDA toolkit (nvcc), so Whisper will use the CPU. To use the GPU, install"
-      echo "    the toolkit (Ubuntu: sudo apt install nvidia-cuda-toolkit), then run ./whisper/build.sh again."
-    fi
+  fi
+
+  case $flavor in
+    cuda) options=(-DGGML_CUDA=1) ;;
+    vulkan) options=(-DGGML_VULKAN=1) ;;
+    cpu) options=() ;;
+    *) echo "Usage: whisper/build.sh [cuda|vulkan|cpu]" >&2; exit 64 ;;
+  esac
+  if ! build "$flavor" ${options[@]+"${options[@]}"}; then
+    [ "$flavor" = cpu ] && exit 1
+    echo "    The $flavor build failed, so Whisper will use the CPU for now (the errors are above)." >&2
     build cpu
   fi
   echo "Built $(pwd)/bin (whisper.cpp $VERSION, $(cut -d' ' -f2 bin/VERSION))"
+  speed_check
   exit 0
 fi
 
@@ -88,3 +127,4 @@ for _ in $(seq 600); do
 done
 
 echo "Built $(pwd)/bin (whisper.cpp $VERSION with Core ML)"
+speed_check

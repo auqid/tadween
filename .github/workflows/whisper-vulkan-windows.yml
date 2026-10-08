@@ -1,0 +1,67 @@
+# Builds whisper.cpp (the TAG in whisper/RELEASE) with Vulkan for 64-bit Windows, so Tadween can use AMD and Intel
+# GPUs there: whisper.cpp publishes no such build. setup.ps1 downloads it from this repository's release
+# "whisper-<TAG>". Runs when whisper/RELEASE changes on main, or by hand (Actions > Run workflow).
+name: whisper.cpp for Windows with Vulkan
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [whisper/RELEASE, .github/workflows/whisper-vulkan-windows.yml]
+
+permissions:
+  contents: write  # to publish the release
+
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      VULKAN_VERSION: 1.4.357.0  # the Vulkan SDK llama.cpp's release builds use
+      ZIP: whisper-bin-win-vulkan-x64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the release
+        run: |
+          $release = Get-Content -Raw whisper/RELEASE | ConvertFrom-StringData
+          Add-Content $env:GITHUB_ENV "TAG=$($release.TAG)"
+
+      - name: Install the Vulkan SDK
+        run: |
+          curl.exe -L --fail -o "$env:RUNNER_TEMP\vulkan-sdk.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\vulkan-sdk.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
+
+      # As whisper.cpp's own Windows release builds, plus Vulkan: every CPU variant, picked at run time.
+      - name: Build
+        run: |
+          git -c advice.detachedHead=false clone --quiet --depth 1 --branch $env:TAG https://github.com/ggml-org/whisper.cpp.git src
+          cmake -S src -B build -A x64 -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON -DWHISPER_BUILD_TESTS=OFF
+          cmake --build build --config Release -j 4
+
+      # This machine has no GPU, so it transcribes on the CPU; that still proves the build and its DLLs load.
+      - name: Check it transcribes
+        run: |
+          curl.exe -L --fail -o ggml-tiny.en.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+          $text = & build\bin\Release\whisper-cli.exe -m ggml-tiny.en.bin -f src\samples\jfk.wav -nt 2>&1 | Out-String
+          Write-Host $text
+          if ($text -notmatch "ask not what your country can do for you") { throw "whisper-cli did not transcribe the sample" }
+          if (-not (Test-Path build\bin\Release\ggml-vulkan.dll)) { throw "no ggml-vulkan.dll" }
+
+      - name: Pack
+        run: Compress-Archive -Path build\bin\Release\* -DestinationPath $env:ZIP
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $name = "whisper-$env:TAG"
+          gh release view $name *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $name --target $env:GITHUB_SHA --prerelease --latest=false `
+              --title "whisper.cpp $env:TAG for Windows, with Vulkan" `
+              --notes "whisper.cpp $env:TAG built with Vulkan for AMD and Intel GPUs on 64-bit Windows. setup.ps1 downloads it; you don't need to."
+          }
+          gh release upload $name $env:ZIP --clobber

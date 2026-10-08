@@ -24,7 +24,7 @@ class Embedder:
         self.ext = sherpa_onnx.SpeakerEmbeddingExtractor(
             # Runs on the CPU while Whisper uses the GPU / Neural Engine: Settings > CPU threads, read at start.
             sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(config.SPEAKER_MODEL),
-                                                       num_threads=config.load_settings()["threads"]))
+                                                       num_threads=config.threads()))
         self.lock = threading.Lock()
 
     @classmethod

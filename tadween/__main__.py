@@ -24,6 +24,9 @@ def main():
     one.add_argument("file")
     one.add_argument("--speakers", type=int, help="how many people talk (default: detect)")
     one.add_argument("--format", default="txt", choices=["txt", "md", "srt", "vtt"])
+    check = sub.add_parser("speed-check", help="time Whisper on this computer's GPU, CPU or Neural Engine and keep "
+                                               "the fastest (Settings can still choose)")
+    check.add_argument("--if-needed", action="store_true", help="only if this whisper.cpp hasn't been timed")
     if len(sys.argv) == 1 or sys.argv[1].startswith("-") and sys.argv[1] not in ("-h", "--help"):
         sys.argv.insert(1, "serve")  # `tadween --port 8766` means the app
     args = parser.parse_args()
@@ -31,6 +34,14 @@ def main():
     if args.cmd == "serve":
         from . import server
         server.run(args.port, open_browser=not args.no_browser)
+        return
+    if args.cmd == "speed-check":
+        from . import config, speed
+        if not (args.if_needed and config.speed_check()):
+            try:
+                print(speed.describe(speed.check()))
+            except Exception as e:  # setup carries on: Tadween then runs Whisper where it can, at default settings
+                print(f"Speed check skipped ({type(e).__name__}: {e}). Try again from Settings.", file=sys.stderr)
         return
 
     from . import edits, pipeline, store

@@ -33,7 +33,8 @@ audio ─► Silero VAD ─► speech only ─► whisper.cpp large-v3-turbo (Ne
 - **Voice grouping.** Voices are grouped by clustering TitaNet embeddings, with a time-smoothing pass so the speaker doesn't flip mid-sentence. Speaker changes then snap to the nearest sentence end. TitaNet was chosen after testing on a real team call: it separated speakers far better than CAM++ or ResNet34. Voiceprints are compared as-is, so a voice saved from one call matches the same person in the next.
 - **Live mode.** On a Mac, audio comes from a small Swift helper ([capture/](capture/)): ScreenCaptureKit for system audio and AVAudioEngine for the mic. On Windows and Linux it comes from [tadween/capture.py](tadween/capture.py), using the soundcard package: a loopback of the speakers (WASAPI) on Windows, the speakers' monitor (PulseAudio or PipeWire) on Linux. Snippets go to a resident `whisper-server`. Whisper takes as long for a short snippet as for 30 seconds of audio, so when a computer without a GPU falls behind, the snippets waiting are sent together and it catches up.
 - **Neural Engine.** On a Mac, `setup.sh` builds whisper.cpp with Core ML ([whisper/build.sh](whisper/build.sh)), so Whisper's encoder runs on the Apple Neural Engine instead of the GPU. Without it, Tadween uses Homebrew's whisper-cpp.
-- **Windows and Linux.** Setup downloads (Windows) or builds (Linux) whisper.cpp for the computer: with CUDA when there is an NVIDIA GPU, otherwise for the CPU.
+- **Windows and Linux.** Setup downloads (Windows) or builds (Linux) whisper.cpp for the computer: with CUDA for an NVIDIA GPU, with Vulkan for AMD and Intel GPUs, otherwise for the CPU. Every platform uses the same whisper.cpp release, set in [whisper/RELEASE](whisper/RELEASE).
+- **Adapts to the computer.** Setup times Whisper on each engine the computer has (Neural Engine and GPU on a Mac, GPU and CPU elsewhere) and uses the fastest: a weak integrated GPU can lose to the CPU, and a big Mac's GPU can beat its Neural Engine ([tadween/speed.py](tadween/speed.py)). Where even the fastest is too slow for live lines with the large model, live lines use a small one; the transcript after the call still uses the large one. CPU threads follow the cores. *Settings → This computer* shows what it found, and every choice there can be changed by hand.
 
 Speed on an M1 MacBook Air (8 GB), measured on a real team call:
 
@@ -75,7 +76,7 @@ powershell -ExecutionPolicy Bypass -File setup.ps1   # Python packages, ffmpeg, 
 .\tadween.cmd                                        # opens http://127.0.0.1:8765
 ```
 
-Setup downloads a ready-made whisper.cpp: the CUDA build when it finds an NVIDIA GPU, otherwise the CPU build. It also fetches ffmpeg into `tools\` unless ffmpeg is already installed. Running it again skips whatever is already done. You can also start Tadween by double-clicking `tadween.cmd`.
+Setup downloads a ready-made whisper.cpp: the CUDA build for an NVIDIA GPU, the Vulkan build for AMD and Intel graphics, otherwise the CPU build. It also fetches ffmpeg into `tools\` unless ffmpeg is already installed. Running it again skips whatever is already done. You can also start Tadween by double-clicking `tadween.cmd`.
 
 ### Linux (tested on Ubuntu 24.04)
 
@@ -87,7 +88,7 @@ cd tadween
 ./tadween.sh      # opens http://127.0.0.1:8765
 ```
 
-Any distribution with Python 3.10 or newer should work. Setup builds whisper.cpp with CUDA when an NVIDIA GPU and the CUDA toolkit are installed (both `nvidia-smi` and `nvcc` work), otherwise for the CPU. Live calls need PulseAudio, or PipeWire with `pipewire-pulse`, the default on current Ubuntu and Fedora.
+Any distribution with Python 3.10 or newer should work. Setup builds whisper.cpp with CUDA for an NVIDIA GPU (when the CUDA toolkit is installed), with Vulkan for an AMD or Intel GPU (when the Vulkan build tools are: `sudo apt install libvulkan-dev glslc spirv-headers mesa-vulkan-drivers`), otherwise for the CPU; if there's a GPU without its tools, it says what to install. Live calls need PulseAudio, or PipeWire with `pipewire-pulse`, the default on current Ubuntu and Fedora.
 
 ### Live calls
 
@@ -107,6 +108,7 @@ The models are not in this repository (about 2 GB in all). Setup (`./setup.sh`, 
 | `silero_vad.onnx` | Silero VAD: finds where people speak | 0.6 MB | [sherpa-onnx `asr-models`](https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models) | MIT |
 | `nemo_en_titanet_large.onnx` | NVIDIA NeMo TitaNet-large: voiceprints | 101 MB | [sherpa-onnx `speaker-recongition-models`](https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recongition-models) | CC BY 4.0 |
 | `ggml-large-v3-turbo-encoder.mlmodelc/` | Whisper's encoder for the Neural Engine (optional) | 1.2 GB | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | MIT |
+| `ggml-small-q8_0.bin` | Whisper small, 8-bit: live lines on computers too slow for the large model (downloaded only then) | 264 MB | [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) | MIT |
 
 To download them by hand instead:
 
@@ -135,19 +137,14 @@ Keep the file names: Tadween looks for exactly these, and whisper.cpp finds the 
 
 ### Running faster
 
+Tadween sets itself up for the computer it runs on (see *Adapts to the computer* above): the engine, the model for live lines and the CPU threads all start on *Automatic*. *Settings → This computer* shows the hardware, what the speed check measured and what Automatic picked, and lets you choose otherwise. After a driver or hardware change, press *Check speed* there (or run `./tadween.sh speed-check`).
+
 **On a Mac.** The numbers above come from a base M1 with 8 GB. On a newer or bigger Mac, in order of impact:
 
-1. **Use the Neural Engine build.** `./setup.sh` installs it, and *Settings → Neural Engine* should say *On*. Newer chips have much faster Neural Engines, so this gains even more there.
-2. **On a Pro, Max or Ultra chip, try the GPU too.** Those chips have many more GPU cores, and Whisper on the GPU may beat the Neural Engine. Time the same recording both ways, with the same *Transcription speed* setting, and keep whichever is faster:
-
-   ```bash
-   time ./tadween.sh transcribe "Team sync.m4a"                           # Neural Engine
-   time TADWEEN_NEURAL_ENGINE=0 ./tadween.sh transcribe "Team sync.m4a"   # GPU only
-   ```
-
-   To stay on the GPU, start Tadween with `TADWEEN_NEURAL_ENGINE=0 ./tadween.sh`, or delete `whisper/bin`. On the GPU, *Faster* also turns on flash attention, the GPU's biggest speed-up.
+1. **Use the Neural Engine build.** `./setup.sh` installs it, and *Settings → Whisper runs on* lists the *Neural Engine*. Newer chips have much faster Neural Engines, so this gains even more there.
+2. **On a Pro, Max or Ultra chip, the GPU may win.** Those chips have many more GPU cores. The speed check times both, and *Automatic* uses the faster; *Settings → Whisper runs on* can pick one yourself. On the GPU, *Faster* also turns on flash attention, the GPU's biggest speed-up.
 3. **Choose Faster transcription** in Settings: about a quarter quicker. It drops most filler words and may word a few phrases differently.
-4. **Match CPU threads to your performance cores.** Voice recognition runs on the CPU while Whisper works. `sysctl -n hw.perflevel0.physicalcpu` shows how many you have (4 on an M1, more on Pro and Max chips). Enter that in *Settings → CPU threads*, then restart Tadween.
+4. **CPU threads follow your performance cores.** Voice recognition runs on the CPU while Whisper works. *Automatic* uses one thread per performance core (4 on an M1, more on Pro and Max chips); *Settings → CPU threads* can set a number, then restart Tadween.
 5. **Leave enough memory free.** Transcribing a long call takes about 2 GB. With 16 GB or more this never matters; on 8 GB, quit memory-hungry apps first, or macOS starts swapping and everything slows down.
 6. **Keep it plugged in and cool.** Turn off Low Power Mode. A fanless MacBook Air slows down as it warms up during a long job; a MacBook Pro or desktop Mac keeps its speed.
 
@@ -155,13 +152,13 @@ Intel Macs have no Neural Engine, so setup skips that step and transcription is 
 
 **On Windows or Linux**, in order of impact:
 
-1. **Use an NVIDIA GPU if the computer has one.** Whisper runs many times faster on it than on the CPU. Its model and working memory come to about 1.3 GB, so a card with 4 GB of memory, like a laptop RTX 3050, is enough.
-   - **Windows:** update the NVIDIA driver and check that `nvidia-smi` runs in PowerShell. Setup then downloads the CUDA build of whisper.cpp, which brings NVIDIA's CUDA libraries with it, so the driver is all you need (one that supports CUDA 11.8 or newer). If you set Tadween up before installing the driver, delete `whisper\bin` and run `setup.ps1` again.
-   - **Linux:** install the NVIDIA driver and the CUDA toolkit (Ubuntu: `sudo apt install nvidia-cuda-toolkit`), then run `./whisper/build.sh` again. Setup also finds a toolkit from NVIDIA's own installer in `/usr/local/cuda`. Without a toolkit it says so and builds for the CPU, and if the CUDA build fails, it builds for the CPU instead.
-   - **To check**, open *Settings → Whisper runs on*: it says *GPU* or *CPU*. While a recording transcribes, the NVIDIA GPU also shows up busy in Task Manager → Performance (Windows) or `nvidia-smi` (both).
-   - AMD and Intel GPUs aren't used: Whisper runs on the CPU there.
-2. **With an NVIDIA GPU, also choose Faster transcription** in Settings. On a CPU alone it makes no real difference: there, nearly all of Whisper's time goes to the part both settings share. Measured on an M1's CPU with the GPU switched off, 80 seconds of a call took 48 s on *Most accurate* and 50 s on *Faster*.
-3. **Give Whisper your CPU cores.** Tadween starts with one thread per core, up to 8. With more cores than that, raise *Settings → CPU threads* (Task Manager → Performance → CPU shows *Cores*; on Linux, `lscpu`), then restart Tadween. Live calls use at most 4, to leave room for the meeting app.
+1. **Use the GPU.** Whisper's model and working memory come to about 1.3 GB, so a card with 4 GB, like a laptop RTX 3050, is enough. The speed check times the GPU against the CPU and *Automatic* keeps the faster, since a weak integrated GPU can lose to the CPU and a card short of memory can fail. *Settings → Whisper runs on* can choose either yourself.
+   - **NVIDIA** gets the CUDA build, the fastest. On Windows, update the driver and check that `nvidia-smi` runs in PowerShell: setup then downloads the CUDA build of whisper.cpp, which brings NVIDIA's CUDA libraries with it, so the driver (one that supports CUDA 11.8 or newer) is all you need. On Linux, also install the CUDA toolkit (Ubuntu: `sudo apt install nvidia-cuda-toolkit`; setup also finds one from NVIDIA's own installer in `/usr/local/cuda`).
+   - **AMD and Intel** (Radeon, Arc, Iris Xe and other integrated graphics) get the Vulkan build. On Windows, keep the graphics driver up to date: setup downloads a Vulkan build that this repository's GitHub Actions make ([workflow](.github/workflows/whisper-vulkan-windows.yml)), since whisper.cpp publishes none for Windows. On Linux, install the Vulkan build tools (Ubuntu: `sudo apt install libvulkan-dev glslc spirv-headers mesa-vulkan-drivers`). Whether the GPU beats the CPU depends on the chip; setup's timing decides.
+   - After adding a GPU or its driver or tools, run setup again (`setup.ps1`, or `./whisper/build.sh` on Linux). On Linux you can also pick the build: `./whisper/build.sh cuda`, `vulkan` or `cpu`.
+   - **To check**, open *Settings → This computer*: it lists the GPU, the times measured, and where Whisper runs. While a recording transcribes, the GPU also shows up busy in Task Manager → Performance (Windows) or `nvidia-smi` (NVIDIA).
+2. **With a GPU, also choose Faster transcription** in Settings. On a CPU alone it makes no real difference: there, nearly all of Whisper's time goes to the part both settings share. Measured on an M1's CPU with the GPU switched off, 80 seconds of a call took 48 s on *Most accurate* and 50 s on *Faster*.
+3. **CPU threads follow your cores.** *Automatic* uses one thread per core, up to 8; *Settings → CPU threads* can set a number (up to 16), then restart Tadween. Live calls use at most 4, to leave room for the meeting app.
 4. **Plug in and pick the best-performance power mode.** On battery, laptops slow their CPUs down.
 5. **Leave enough memory free.** Transcribing a long call takes about 2 GB; 16 GB of memory leaves plenty of room.
 
@@ -170,6 +167,7 @@ Intel Macs have no Neural Engine, so setup skips that step and transcription is 
 ```bash
 ./tadween.sh transcribe "Team sync.m4a"                # writes "Team sync - transcript.txt" next to it
 ./tadween.sh transcribe call.mp4 --speakers 5 --format md
+./tadween.sh speed-check                               # time Whisper on each engine here; Automatic then uses the fastest
 ```
 
 On Windows, use `.\tadween.cmd` in place of `./tadween.sh`.
@@ -190,7 +188,7 @@ Delete a transcript in the app, or delete the folder, to remove it completely.
 ## Limitations
 
 - **Speaker separation depends on the audio.** One phone recording a room is the hardest case. Live capture of the call audio is much cleaner. If Tadween splits one person into two, merge them. If it lumps people together, set the number of people.
-- **Live lines appear in bursts.** Each line shows up a moment after a person pauses, not word by word. Without a GPU (a Windows or Linux computer without an NVIDIA card), each line costs the CPU as much as 30 seconds of audio (about 15 s on an M1's CPU), so lines arrive later and several at a time. The transcript you get after Stop is complete either way.
+- **Live lines appear in bursts.** Each line shows up a moment after a person pauses, not word by word. Without a fast GPU or Neural Engine, Whisper's large model costs the CPU as much as 30 seconds of audio for every line (about 15 s on an M1's CPU), so *Automatic* switches live lines to the small model: drafts a little rougher, but on time. The transcript you get after Stop always uses the large model.
 - **Live mode assumes your mic is only you.** If the call audio stays silent (people in the room, or a call on another device), the live view labels everything your mic hears as you and says so. The final transcript then tells the voices on your mic apart, as for a recording.
 - **Live text and labels are a draft.** After you press Stop, the whole call is transcribed again for the final version. With the Neural Engine this takes about a tenth of the call's length. On a CPU alone it takes much longer: an M1's CPU needs about 50 s for each 80 s of conversation.
 - **Settings default to English.** For other languages, change the language in Settings.
@@ -198,11 +196,13 @@ Delete a transcript in the app, or delete the folder, to remove it completely.
 ## Project layout
 
 ```
-tadween/      Python app: pipeline, speakers, word fixes, live sessions, local web server,
-              and capture.py, which records live calls on Windows and Linux
+tadween/      Python app: pipeline, speakers, word fixes, live sessions, local web server; speed.py and
+              hardware.py, which fit Tadween to the computer; capture.py, live-call audio on Windows and Linux
 web/          The interface (plain HTML/CSS/JS, no build step)
 capture/      macOS helper (Swift) that streams system audio / microphone as 16 kHz PCM
-whisper/      build.sh builds whisper.cpp for this computer: Core ML on a Mac, CUDA or CPU on Linux
+whisper/      build.sh builds whisper.cpp for this computer: Core ML on a Mac; CUDA, Vulkan or CPU on Linux.
+              RELEASE sets the whisper.cpp version every platform uses
+.github/      The workflow that builds whisper.cpp with Vulkan for Windows (AMD and Intel GPUs)
 setup.sh      One-time setup, macOS and Linux     tadween.sh    Launcher, macOS and Linux
 setup.ps1     One-time setup, Windows             tadween.cmd   Launcher, Windows
 ```

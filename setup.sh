@@ -61,9 +61,12 @@ if [ "$OS" = "Darwin" ]; then
     echo "    Skipped - Tadween will use Homebrew's whisper-cpp. Run ./whisper/build.sh later to try again."
   fi
 else
-  echo "==> whisper.cpp (built for this computer: CUDA with an NVIDIA GPU and the CUDA toolkit, otherwise CPU)"
+  echo "==> whisper.cpp, built for this computer's GPU (CUDA or Vulkan) or its CPU"
   ./whisper/build.sh
 fi
+
+echo "==> Speed check: where Whisper runs fastest here (Settings can change it)"
+.venv/bin/python -m tadween speed-check --if-needed
 
 echo
 echo "Done. Start Tadween with:  ./tadween.sh"

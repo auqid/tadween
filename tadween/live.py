@@ -16,6 +16,7 @@ from datetime import datetime
 import numpy as np
 
 from . import asr, audio, config, events, pipeline, speakers, store, vad, vocab
+from . import speed as speed_check  # "speed" in this module is how fast a replay plays
 
 SR = config.SAMPLE_RATE
 # A computer without a GPU can fall behind, as Whisper takes as long for a short snippet as for 30 s. Then the
@@ -137,6 +138,8 @@ class LiveSession:
                                 "linux": "Live calls need the soundcard package. Run ./setup.sh again."}[config.PLATFORM])
         if not (mic or system or simulate):
             raise ValueError("Pick at least one audio source.")
+        if speed_check.running.locked():
+            raise RuntimeError("A speed check is timing this computer (about a minute). Start the call when it's done.")
         self.settings = config.load_settings()
         self.t = store.create(title, kind="live", status="live")
         self.id, self.dir = self.t["id"], store.folder(self.t["id"])
@@ -367,7 +370,9 @@ def start(title=None, mic=True, system=True, apps="", simulate=None, speed=1.0):
     with _lock:
         if _session and _session.running:
             raise RuntimeError("A live session is already running.")
-        session = LiveSession(title or f"Call {datetime.now():%b %-d, %-I:%M %p}", mic, system, apps, simulate, speed)
+        now = datetime.now()  # not %-d or %-I: Windows' strftime has neither
+        session = LiveSession(title or f"Call {now:%b} {now.day}, {now.hour % 12 or 12}:{now:%M %p}", mic, system, apps,
+                              simulate, speed)
         session.start()
         _session = session
         return session.status()
