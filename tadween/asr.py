@@ -77,7 +77,7 @@ def decoding_args(settings):
 
 def _run_cli(wav, out_base, prompt, settings, progress, fresh_context):
     cmd = [config.whisper_tool("whisper-cli"), "-m", str(config.WHISPER_MODEL), "-f", str(wav),
-           "-l", settings["language"], "-t", str(settings["threads"]),
+           *config.whisper_gpu_args(), "-l", settings["language"], "-t", str(config.threads(settings)),
            "-ojf", "-of", str(out_base), "-pp", *decoding_args(settings)]
     if prompt:
         cmd += ["--prompt", prompt, "--carry-initial-prompt"]
@@ -249,8 +249,9 @@ class WhisperServer:
     def __init__(self, settings):
         self.port = _free_port()
         self.proc = subprocess.Popen(
-            [config.whisper_tool("whisper-server"), "-m", str(config.WHISPER_MODEL), "--host", "127.0.0.1",
-             "--port", str(self.port), "-l", settings["language"], "-t", str(min(4, settings["threads"]))],
+            [config.whisper_tool("whisper-server"), "-m", str(config.live_model(settings)),  # small on slow computers
+             *config.whisper_gpu_args(), "--host", "127.0.0.1", "--port", str(self.port), "-l", settings["language"],
+             "-t", str(min(4, config.threads(settings)))],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # The Neural Engine build compiles its encoder on a program's first start (about two minutes;
         # whisper/build.sh does it ahead of time, but a macOS update can clear that cache).

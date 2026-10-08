@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import align, asr, audio, config, events, speakers, store, vad, vocab
+from . import align, asr, audio, config, events, speakers, speed, store, vad, vocab
 
 live_active = threading.Event()  # set during a live call: queued jobs wait so the call stays smooth
 _jobs = queue.Queue()
@@ -77,7 +77,7 @@ def start():
 def _work():
     while True:
         tid = _jobs.get()
-        while live_active.is_set():
+        while live_active.is_set() or speed.running.locked():  # a speed check is timing this computer
             time.sleep(2)
         try:
             process(tid)

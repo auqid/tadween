@@ -3,7 +3,8 @@
 #     powershell -ExecutionPolicy Bypass -File setup.ps1
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-$WhisperRelease = "b5454"  # whisper.cpp v1.9.5 Windows builds
+$release = Get-Content -Raw whisper\RELEASE | ConvertFrom-StringData  # TAG, and WINDOWS_BUILD: its Windows builds
+$WhisperRelease = $release.WINDOWS_BUILD
 
 function Fetch($Url, $Dest) {
     if ((Test-Path $Dest) -and (Get-Item $Dest).Length -gt 0) { return }
@@ -61,22 +62,43 @@ if (-not (Get-Command ffprobe -ErrorAction SilentlyContinue) -and -not (Test-Pat
 }
 
 Write-Host "==> whisper.cpp"
-if (-not (Test-Path whisper\bin\whisper-cli.exe)) {
-    $asset = "whisper-bin-x64.zip"  # CPU
-    if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {  # an NVIDIA GPU: the CUDA build its driver supports
-        if ((& nvidia-smi | Out-String) -match "CUDA Version:\s*([\d.]+)") {
-            $cuda = [version]$Matches[1]
-            if ($cuda -ge [version]"12.4") { $asset = "whisper-bin-win-cuda-12.4.0-x64.zip" }
-            elseif ($cuda -ge [version]"11.8") { $asset = "whisper-bin-win-cuda-11.8.0-x64.zip" }
+# An NVIDIA GPU gets the CUDA build its driver supports. AMD and Intel graphics (or an NVIDIA driver too old for
+# CUDA 11.8) get a Vulkan build: whisper.cpp publishes none for Windows, so this repository's GitHub Actions
+# make it (.github/workflows/whisper-vulkan-windows.yml). Anything else, or no Vulkan build yet: the CPU build.
+$cpuBuilds = "https://github.com/ggml-org/whisper.cpp/releases/download/$WhisperRelease"
+$builds = $cpuBuilds
+$asset = "whisper-bin-x64.zip"
+if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+    if ((& nvidia-smi | Out-String) -match "CUDA Version:\s*([\d.]+)") {
+        $cuda = [version]$Matches[1]
+        if ($cuda -ge [version]"12.4") { $asset = "whisper-bin-win-cuda-12.4.0-x64.zip" }
+        elseif ($cuda -ge [version]"11.8") { $asset = "whisper-bin-win-cuda-11.8.0-x64.zip" }
+    }
+}
+if ($asset -eq "whisper-bin-x64.zip" -and (Test-Path "$env:WINDIR\System32\vulkan-1.dll")) {  # a GPU driver with Vulkan
+    $gpus = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+        ForEach-Object { "$($_.AdapterCompatibility) $($_.Name)" }) -join "; "
+    if ($gpus -match "AMD|Advanced Micro Devices|Radeon|Intel|NVIDIA") {
+        $asset = "whisper-bin-win-vulkan-x64.zip"
+        $builds = "https://github.com/auqid/tadween/releases/download/whisper-$($release.TAG)"
+        if ((curl.exe -sIL -o NUL -w "%{http_code}" "$builds/$asset") -ne "200") {
+            Write-Host "    There's no Vulkan build for whisper.cpp $($release.TAG) yet, so Whisper will use the CPU."
+            $asset = "whisper-bin-x64.zip"
+            $builds = $cpuBuilds
         }
     }
+}
+$want = "$WhisperRelease $asset"
+$have = if (Test-Path whisper\bin\VERSION) { (Get-Content -Raw whisper\bin\VERSION).Trim() } else { "" }
+if ($have -ne $want -or -not (Test-Path whisper\bin\whisper-cli.exe)) {  # first time, new release, or new GPU
     Write-Host "    $asset"
+    Fetch "$builds/$asset" "whisper\$asset"
+    if (Test-Path whisper\bin) { Remove-Item -Recurse -Force whisper\bin }  # no DLLs left over from another build
     New-Item -ItemType Directory -Force whisper\bin | Out-Null
-    Fetch "https://github.com/ggml-org/whisper.cpp/releases/download/$WhisperRelease/$asset" "whisper\$asset"
     Expand-Archive -Force "whisper\$asset" whisper\unpacked
     Copy-Item -Force (Get-ChildItem whisper\unpacked -Recurse -File).FullName whisper\bin\
     Remove-Item -Recurse -Force whisper\unpacked, "whisper\$asset"
-    Set-Content whisper\bin\VERSION "$WhisperRelease $asset"
+    Set-Content whisper\bin\VERSION $want
 }
 
 Write-Host "==> Models (downloaded once)"
@@ -85,6 +107,10 @@ Fetch "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-t
 Fetch "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx" "models\silero_vad.onnx"
 # (the release tag really is spelled "recongition")
 Fetch "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_large.onnx" "models\nemo_en_titanet_large.onnx"
+
+# A weak integrated GPU can be slower than the CPU, and a card short of memory can fail: time them once.
+Write-Host "==> Speed check: where Whisper runs fastest here (Settings can change it)"
+& $venvPython -m tadween speed-check --if-needed
 
 Write-Host ""
 Write-Host "Done. Start Tadween with:  .\tadween.cmd"

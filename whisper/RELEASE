@@ -1,0 +1,5 @@
+# The whisper.cpp release Tadween uses on every platform. whisper/build.sh builds TAG from source (macOS, Linux);
+# setup.ps1 downloads WINDOWS_BUILD, the same release's ready-made Windows binaries, and the Vulkan build that
+# this repository's GitHub Actions make from TAG (.github/workflows/whisper-vulkan-windows.yml).
+TAG=v1.9.5
+WINDOWS_BUILD=b5454

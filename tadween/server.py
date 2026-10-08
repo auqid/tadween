@@ -9,7 +9,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
-from . import config, edits, events, live, pipeline, speakers, store, vocab
+from . import config, edits, events, hardware, live, models, pipeline, speakers, speed, store, vocab
 
 ROUTES = []
 TID = r"([a-z0-9-]+)"
@@ -142,10 +142,35 @@ class Handler(BaseHTTPRequestHandler):
 
 @route("GET", "/api/state")
 def state(h):
-    return {"settings": config.load_settings(), "live": live.status(),
+    settings = config.load_settings()
+    return {"settings": settings, "live": live.status(),
             "capture_helper": live.capture_available(), "platform": config.PLATFORM,
-            "whisper_build": config.whisper_build(), "neural_engine": config.neural_engine(),
-            "neural_engine_installed": config.neural_engine_installed()}
+            "whisper_build": config.whisper_build(), "neural_engine_installed": config.neural_engine_installed(),
+            **machine(settings)}
+
+
+def machine(settings):
+    """This computer and where Whisper runs on it, for Settings."""
+    return {"hardware": hardware.summary(), "speed": config.speed_check(), "speed_checking": speed.running.locked(),
+            "engines": config.engines(), "engine": config.engine(settings),
+            "live_model": "small" if config.live_model(settings) == config.SMALL_MODEL else "large",
+            "small_model": config.SMALL_MODEL.exists(), "download": models.state,
+            "threads": config.threads(settings), "auto_threads": hardware.auto_threads()}
+
+
+@route("POST", "/api/speed-check")
+def speed_check(h):
+    if live.status()["running"] or any(s["status"] in ("queued", "processing") for s in store.summaries()):
+        raise RuntimeError("Wait until the live call or transcription is done: it would slow the check down.")
+
+    def done(result, error):
+        if error:
+            events.emit("speed", running=False, error=f"{type(error).__name__}: {error}")
+        else:
+            events.emit("speed", running=False, message=speed.describe(result))
+
+    speed.start(say=lambda message: events.emit("speed", running=True, message=message.strip()), done=done)
+    return {"started": True}
 
 
 @route("GET", "/api/events")
@@ -339,7 +364,11 @@ def get_settings(h):
 
 @route("PUT", "/api/settings")
 def put_settings(h):
-    return config.save_settings(h.body())
+    settings = config.save_settings(h.body())
+    wanted = settings["live_model"]
+    if (wanted if wanted != "auto" else (config.speed_check() or {}).get("live_model")) == "small":
+        models.fetch_small_in_background()  # now, rather than when a call starts
+    return settings
 
 
 # --- live ------------------------------------------------------------------------------------------
@@ -374,6 +403,7 @@ def run(port=8765, open_browser=True):
     except OSError:
         raise SystemExit(f"Port {port} is busy - is Tadween already running? Try --port {port + 1}.")
     pipeline.start()  # only once the port is ours: a launch that can't run must not touch the running app's work
+    threading.Thread(target=hardware.summary, daemon=True).start()  # Windows asks PowerShell: a second or two
     server.daemon_threads = True
     url = f"http://127.0.0.1:{port}/"
     print(f"Tadween is running at {url}  (Ctrl+C to stop)")

@@ -992,10 +992,88 @@ function renamePerson(anchor, p) {
   name.select();
 }
 
-/** A settings row that shows (not sets) where Whisper runs. */
-const engine = (label, help, on, value) => el("div", { class: "setting" },
-  el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, label), el("span", { class: "setting-help" }, help)),
-  el("span", { class: `engine${on ? " on" : ""}` }, value));
+// ---------- this computer: where Whisper runs, chosen automatically unless Settings say otherwise ----------
+
+const ENGINE = { neural_engine: "Neural Engine", gpu: "GPU", cpu: "CPU" };
+const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
+
+/** "Apple M1 · 8 cores (4 performance) · 8 GB memory · Neural Engine" */
+function hardwareText(hw = {}) {
+  const parts = [hw.cpu || "Unknown processor"];
+  if (hw.cores) {
+    parts.push(!hw.performance_cores || hw.performance_cores === hw.cores ? `${hw.cores} cores`
+      : mac() ? `${hw.cores} cores (${hw.performance_cores} performance)` : `${hw.performance_cores} cores, ${hw.cores} threads`);
+  }
+  if (hw.memory) parts.push(`${Math.round(hw.memory / 2 ** 30)} GB memory`);
+  parts.push(...(hw.gpus || []).filter((g) => !(mac() && hw.cpu && g.startsWith(hw.cpu))));  // a Mac's GPU is its chip
+  if (hw.neural_engine) parts.push("Neural Engine");
+  return parts.join(" · ");
+}
+
+/** What Automatic means here: the speed check's pick, else the first engine this computer has. */
+const autoEngine = () => (state.engines.includes(state.speed?.engine) ? state.speed.engine : state.engines[0]);
+
+function engineHelp(s) {
+  const sp = state.speed;
+  const measured = sp ? `Measured here: ${Object.entries(sp.times).map(([e, ms]) => `${ENGINE[e]} ${ms ? secs(ms) : "failed"}`).join(", ")} for 30 seconds of audio.`
+    : "Not measured yet: use Check speed below.";
+  const wanted = state.engines.includes(s.engine) ? s.engine : autoEngine();
+  const forced = state.engine !== wanted ? ` Right now Whisper runs on the ${ENGINE[state.engine]}, as set by an environment variable when Tadween started.` : "";
+  if (state.engines.length > 1) return `Automatic picks the fastest. ${measured}${forced}`;
+  if (mac()) return `${measured} On Apple Silicon, ./whisper/build.sh adds the Neural Engine, about 1.7× faster on an M1.`;
+  if (!state.whisperBuild) return "The whisper.cpp on your PATH, so Tadween can't tell whether it uses a GPU.";
+  return `${measured} ${state.platform === "windows" ? "For an NVIDIA, AMD or Intel GPU, update its driver, then run setup.ps1 again."
+    : "For a GPU, run ./whisper/build.sh: it says what to install (the CUDA toolkit for NVIDIA, Vulkan build tools for AMD and Intel)."}`;
+}
+
+function liveModelHelp(s) {
+  const sp = state.speed, d = state.download || {};
+  const auto = !sp ? "Automatic uses Large unless a speed check finds this computer too slow for live lines with it."
+    : sp.live_model === "small" ? `Automatic uses Small here: Large needs ${secs(sp.times[sp.engine])} for 30 seconds of audio on the ${ENGINE[sp.engine]}, too slow for live lines.`
+      : "Automatic uses Large: it's quick enough here.";
+  const wantsSmall = s.live_model === "small" || (s.live_model === "auto" && sp?.live_model === "small");
+  const download = d.downloading ? ` Downloading the small model… ${Math.round((d.fraction || 0) * 100)}%.`
+    : d.error ? ` The small model's download failed (${d.error}); live lines use Large until it works.`
+      : wantsSmall && !state.smallModel ? " The small model (264 MB) downloads when you save; until then live lines use Large." : "";
+  return `${auto} Transcripts after a call always use Large.${download}`;
+}
+
+function speedText() {
+  if (state.speedChecking) return state.speedMessage || "Checking… about a minute.";
+  if (state.speedError) return `The check failed: ${state.speedError}`;
+  return state.speed ? `Last checked ${new Date(state.speed.checked * 1000).toLocaleString()}. Run it again after a driver or hardware change.`
+    : "Times Whisper on each engine this computer has, so Automatic can pick the fastest. About a minute.";
+}
+
+function speedRow() {
+  const button = el("button", { id: "speed-check", disabled: state.speedChecking, onclick: async () => {
+    try {
+      await api("POST", "/api/speed-check");
+      Object.assign(state, { speedChecking: true, speedMessage: null, speedError: null });
+      updateSpeedRow();
+    } catch (e) { fail(e); }
+  } }, state.speedChecking ? "Checking…" : state.speed ? "Check again" : "Check speed");
+  return el("div", { class: "setting", id: "speed-row" },
+    el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Speed check"), el("span", { class: "setting-help", id: "speed-status" }, speedText())),
+    button);
+}
+
+function updateSpeedRow() { $("#speed-row")?.replaceWith(speedRow()); }
+
+/** Where Whisper runs and how fast, from /api/state. */
+function applyMachine(s) {
+  Object.assign(state, { hardware: s.hardware, speed: s.speed, speedChecking: s.speed_checking, engines: s.engines,
+    engine: s.engine, liveModel: s.live_model, smallModel: s.small_model, download: s.download, autoThreads: s.auto_threads,
+    whisperBuild: s.whisper_build, neuralEngineInstalled: s.neural_engine_installed });
+}
+
+async function refreshMachine() {
+  let s;
+  try { s = await api("GET", "/api/state"); } catch { return; }
+  applyMachine(s);
+  if (location.hash === "#/settings" && !state.settingsDirty) renderSettings();
+  else updateSpeedRow();
+}
 
 async function renderSettings() {
   let s;
@@ -1003,7 +1081,12 @@ async function renderSettings() {
   const name = el("input", { value: s.my_name });
   const lang = el("select", {}, [["en", "English"], ["auto", "Detect automatically"], ["ar", "Arabic"], ["hi", "Hindi"], ["ur", "Urdu"], ["es", "Spanish"], ["fr", "French"], ["de", "German"]]
     .map(([v, l]) => el("option", { value: v, selected: s.language === v }, l)));
-  const threads = el("input", { type: "number", min: 1, max: 16, value: s.threads });
+  const threads = el("select", {}, [["auto", `Automatic (${state.autoThreads})`], ...Array.from({ length: 16 }, (_, i) => [i + 1, String(i + 1)])]
+    .map(([v, l]) => el("option", { value: v, selected: String(s.threads) === String(v) }, l)));
+  const engineChoice = el("select", { disabled: state.engines.length < 2 }, [["auto", `Automatic (${ENGINE[autoEngine()]})`], ...state.engines.map((e) => [e, ENGINE[e]])]
+    .map(([v, l]) => el("option", { value: v, selected: s.engine === v }, l)));
+  const liveModel = el("select", {}, [["auto", `Automatic (${state.speed?.live_model === "small" ? "Small" : "Large"})`], ["large", "Large: most accurate"], ["small", "Small: fastest"]]
+    .map(([v, l]) => el("option", { value: v, selected: s.live_model === v }, l)));
   const sep = el("input", { type: "range", min: 0.5, max: 1.0, step: 0.05, value: s.speaker_threshold });
   const match = el("input", { type: "range", min: 0.3, max: 0.8, step: 0.05, value: s.voice_match_threshold });
   const prompt = el("input", { value: s.initial_prompt });
@@ -1012,40 +1095,41 @@ async function renderSettings() {
   const setting = (label, help, control, stack = false) => el("label", { class: `setting${stack ? " stack" : ""}` },
     el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, label), help ? el("span", { class: "setting-help" }, help) : null), control);
   const scale = (input, left, right) => el("span", {}, input, el("span", { class: "range-ends", "aria-hidden": "true" }, el("span", {}, left), el("span", {}, right)));
-  view(pageView(
+  state.settingsDirty = false;
+  const edited = () => { state.settingsDirty = true; };  // a speed check finishing mustn't wipe unsaved changes
+  const page = pageView(
     el("h1", {}, "Settings"),
     el("h2", {}, "Transcription"),
     el("div", { class: "group" },
       setting("Your name", "Used for your microphone in live calls.", name),
       setting("Language spoken in calls", null, lang),
-      setting("Transcription speed", `Faster decodes greedily: ${mac() ? "about a quarter quicker" : "quicker with an NVIDIA GPU, but no quicker on a CPU alone"}. It drops most filler words like “um” and may word a few phrases differently.`, speed),
-      mac()
-        ? engine("Neural Engine", state.neuralEngine
-          ? "On: Whisper's encoder runs on the Mac's Neural Engine, about 1.7× faster than the GPU on an M1."
-          : state.neuralEngineInstalled
-            ? "Off: turned off with TADWEEN_NEURAL_ENGINE=0, so Whisper runs on the GPU."
-            : "Off. On Apple Silicon, run ./whisper/build.sh in the Tadween folder to transcribe about 1.7× faster.",
-        state.neuralEngine, state.neuralEngine ? "On" : "Off")
-        : engine("Whisper runs on", {
-          cuda: "The NVIDIA GPU, with the CUDA build of whisper.cpp.",
-          cpu: state.platform === "windows"
-            ? "The CPU. For an NVIDIA GPU, update its driver, delete the whisper\\bin folder and run setup.ps1 again."
-            : "The CPU. For an NVIDIA GPU, install the CUDA toolkit and run ./whisper/build.sh again.",
-        }[state.whisperBuild] || "The whisper.cpp on your PATH, so Tadween can't tell whether it uses a GPU.",
-        state.whisperBuild === "cuda", { cuda: "GPU", cpu: "CPU" }[state.whisperBuild] || "Your own"),
-      setting("Whisper style prompt", "A punctuated sentence Whisper imitates. Keep it short.", prompt),
-      setting("CPU threads", "For Whisper and voice recognition. Use the number of performance cores this computer has; restart Tadween after changing it.", threads)),
+      setting("Transcription speed", `Faster decodes greedily: ${mac() ? "about a quarter quicker" : "quicker on a GPU, but no quicker on a CPU alone"}. It drops most filler words like “um” and may word a few phrases differently.`, speed),
+      setting("Whisper style prompt", "A punctuated sentence Whisper imitates. Keep it short.", prompt)),
     el("h2", {}, "Voices"),
     el("div", { class: "group" },
       setting("Voice grouping", "Applies to new transcripts. To regroup an existing one, use Speakers in its header.", scale(sep, "More speakers", "Fewer speakers"), true),
       setting("Recognising saved voices", "How sure Tadween must be before it names someone from a saved voice.", scale(match, "Name people more eagerly", "Only when very sure"), true)),
+    el("h2", {}, "This computer"),
+    el("div", { class: "group" },
+      el("div", { class: "setting stack" }, el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Hardware"),
+        el("span", { class: "setting-help" }, hardwareText(state.hardware)))),
+      setting("Whisper runs on", engineHelp(s), engineChoice),
+      setting("Model for live lines", el("span", { id: "live-model-help" }, liveModelHelp(s)), liveModel),
+      setting("CPU threads", "For Whisper and voice recognition. Automatic uses one per performance core. Restart Tadween after changing it.", threads),
+      speedRow()),
     el("div", { class: "form-foot" }, el("button", { class: "primary", onclick: async () => {
       try {
-        state.settings = await api("PUT", "/api/settings", { my_name: name.value.trim() || "Me", language: lang.value, threads: Number(threads.value) || 4,
+        state.settings = await api("PUT", "/api/settings", { my_name: name.value.trim() || "Me", language: lang.value,
+          threads: threads.value === "auto" ? "auto" : Number(threads.value), engine: engineChoice.value, live_model: liveModel.value,
           speaker_threshold: Number(sep.value), voice_match_threshold: Number(match.value), initial_prompt: prompt.value.trim(), speed: speed.value });
+        state.settingsDirty = false;
         toast("Settings saved.");
+        refreshMachine();
       } catch (e) { fail(e); }
-    } }, "Save settings"))));
+    } }, "Save settings")));
+  page.addEventListener("input", edited);
+  page.addEventListener("change", edited);
+  view(page);
 }
 
 // ---------- live updates from the server ----------
@@ -1053,6 +1137,17 @@ async function renderSettings() {
 let reloadTimer = null;
 const handlers = {
   transcripts: () => loadList(),
+  speed: (m) => {
+    Object.assign(state, { speedChecking: m.running, speedMessage: m.running ? m.message : null, speedError: m.error || null });
+    if (m.running) updateSpeedRow();
+    else { if (m.message) toast(m.message); refreshMachine(); }
+  },
+  download: (m) => {
+    state.download = m;
+    if (m.fraction === 1 && !m.downloading) state.smallModel = true;
+    const help = $("#live-model-help");
+    if (help) help.textContent = liveModelHelp(state.settings);
+  },
   progress: (m) => {
     const item = state.list.find((x) => x.id === m.id);
     if (item) { item.status = "processing"; item.progress = m.progress; renderList(); }
@@ -1134,9 +1229,7 @@ setInterval(tickClocks, 1000);
     state.live = s.live;
     state.capture = s.capture_helper;
     state.platform = s.platform;
-    state.whisperBuild = s.whisper_build;
-    state.neuralEngine = s.neural_engine;
-    state.neuralEngineInstalled = s.neural_engine_installed;
+    applyMachine(s);
     connectEvents();
     await loadList();
     addEventListener("hashchange", route);
