@@ -155,7 +155,11 @@ Intel Macs have no Neural Engine, so setup skips that step and transcription is 
 
 **On Windows or Linux**, in order of impact:
 
-1. **Use an NVIDIA GPU if the computer has one.** Whisper runs many times faster on it than on the CPU. Update the NVIDIA driver first. On Windows, setup picks the CUDA build when the driver supports CUDA 11.8 or newer; if you set Tadween up before installing the driver, delete `whisper\bin` and run `setup.ps1` again. On Linux, also install the CUDA toolkit (Ubuntu: `sudo apt install nvidia-cuda-toolkit`), then run `./whisper/build.sh` again; without the toolkit, setup says so and builds for the CPU. *Settings → Whisper runs on* shows *GPU* or *CPU*. AMD and Intel GPUs aren't used: Whisper runs on the CPU there.
+1. **Use an NVIDIA GPU if the computer has one.** Whisper runs many times faster on it than on the CPU. Its model and working memory come to about 1.3 GB, so a card with 4 GB of memory, like a laptop RTX 3050, is enough.
+   - **Windows:** update the NVIDIA driver and check that `nvidia-smi` runs in PowerShell. Setup then downloads the CUDA build of whisper.cpp, which brings NVIDIA's CUDA libraries with it, so the driver is all you need (one that supports CUDA 11.8 or newer). If you set Tadween up before installing the driver, delete `whisper\bin` and run `setup.ps1` again.
+   - **Linux:** install the NVIDIA driver and the CUDA toolkit (Ubuntu: `sudo apt install nvidia-cuda-toolkit`), then run `./whisper/build.sh` again. Setup also finds a toolkit from NVIDIA's own installer in `/usr/local/cuda`. Without a toolkit it says so and builds for the CPU, and if the CUDA build fails, it builds for the CPU instead.
+   - **To check**, open *Settings → Whisper runs on*: it says *GPU* or *CPU*. While a recording transcribes, the NVIDIA GPU also shows up busy in Task Manager → Performance (Windows) or `nvidia-smi` (both).
+   - AMD and Intel GPUs aren't used: Whisper runs on the CPU there.
 2. **With an NVIDIA GPU, also choose Faster transcription** in Settings. On a CPU alone it makes no real difference: there, nearly all of Whisper's time goes to the part both settings share. Measured on an M1's CPU with the GPU switched off, 80 seconds of a call took 48 s on *Most accurate* and 50 s on *Faster*.
 3. **Give Whisper your CPU cores.** Tadween starts with one thread per core, up to 8. With more cores than that, raise *Settings → CPU threads* (Task Manager → Performance → CPU shows *Cores*; on Linux, `lscpu`), then restart Tadween. Live calls use at most 4, to leave room for the meeting app.
 4. **Plug in and pick the best-performance power mode.** On battery, laptops slow their CPUs down.
@@ -208,3 +212,4 @@ setup.ps1     One-time setup, Windows             tadween.cmd   Launcher, Window
 - A browser extension that reads exact participant names from Google Meet or the Zoom web client.
 - Import Zoom's "separate audio file per participant" recordings for perfect speaker labels.
 - Meeting summaries and action items.
+- A model setting for computers with a GPU: Whisper large-v3, a bit more accurate than large-v3-turbo on hard audio but slower (its 5-bit version, 1.1 GB, fits a 4 GB card), or NVIDIA Parakeet, which whisper.cpp now supports: fast and accurate for English and 24 other European languages, but without word-fix hints or live calls.
