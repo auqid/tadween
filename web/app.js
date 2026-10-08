@@ -46,6 +46,8 @@ const plural = (n, word, many = `${word}s`) => `${n.toLocaleString()} ${n === 1 
 const escapeRx = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const squash = (s) => s.replace(/\s+/g, " ").trim();
 const isDefaultName = (name) => /^Speaker \d+$/.test(name);
+const mac = () => (state.platform || "mac") === "mac";
+const computer = () => (mac() ? "Mac" : "computer");
 
 function color(label) {
   if (label === "ME") return "var(--me)";
@@ -207,7 +209,7 @@ const pageView = (...kids) => el("div", { class: "page" }, el("div", { class: "c
 function renderHome() {
   view(pageView(
     el("h1", {}, "Transcribe a call"),
-    el("p", { class: "lede" }, "Add a recording, or transcribe a call live while it happens. Everything runs on this Mac, so audio never leaves it."),
+    el("p", { class: "lede" }, `Add a recording, or transcribe a call live while it happens. Everything runs on this ${computer()}, so audio never leaves it.`),
     el("label", { class: "dropzone" },
       icon("upload"),
       el("strong", {}, "Drop a recording here, or choose a file"),
@@ -220,7 +222,7 @@ function renderHome() {
     el("dl", { class: "facts" },
       el("div", {}, el("dt", {}, "Names that stick"), el("dd", {}, "Click a speaker in a transcript and type their name. Tadween remembers the voice and labels them in later calls.")),
       el("div", {}, el("dt", {}, "Fix once"), el("dd", {}, "Correct a word and Tadween offers to fix every occurrence, and to fix it in future transcripts too.")),
-      el("div", {}, el("dt", {}, "Stays on this Mac"), el("dd", {}, "Speech recognition and voice matching run locally. Voices are stored as voiceprints, not audio.")))));
+      el("div", {}, el("dt", {}, `Stays on this ${computer()}`), el("dd", {}, "Speech recognition and voice matching run locally. Voices are stored as voiceprints, not audio.")))));
 }
 
 // ---------- transcript ----------
@@ -814,8 +816,10 @@ function liveNotice() {
     && Date.now() / 1000 - state.live.started > 20;
   return quiet ? el("p", { class: "banner notice" },
     "The call audio is silent, so everyone your mic hears is shown as you for now. In a meeting with people in the room, "
-    + "Tadween tells the voices apart when you press Stop. On a call on this Mac, check that its sound plays on this Mac, "
-    + "and that the app running Tadween is allowed in System Settings › Privacy & Security › Screen & System Audio Recording.") : null;
+    + `Tadween tells the voices apart when you press Stop. On a call on this ${computer()}, check that its sound plays on this ${computer()}`
+    + { mac: ", and that the app running Tadween is allowed in System Settings › Privacy & Security › Screen & System Audio Recording.",
+        windows: ", through the default speakers or headphones.",
+        linux: ", through the default output device (PulseAudio or PipeWire)." }[state.platform || "mac"]) : null;
 }
 
 function sourcesEls() {
@@ -899,17 +903,22 @@ function renderLiveStart() {
   const source = (input, label, help) => el("label", { class: "check" }, input, el("span", { class: "check-text" }, el("span", {}, label), el("span", { class: "muted" }, help)));
   view(pageView(
     el("h1", {}, "Live transcription"),
-    el("p", { class: "lede" }, "Tadween listens to your microphone (that's you) and to this Mac's sound output (everyone else on the call), and writes down who said what while you talk."),
-    state.capture ? null : el("div", { class: "warn" }, "The audio capture helper isn't built yet. In a terminal, run ", el("code", {}, "./setup.sh"), " in the Tadween folder, then reload this page."),
+    el("p", { class: "lede" }, `Tadween listens to your microphone (that's you) and to this ${computer()}'s sound output (everyone else on the call), and writes down who said what while you talk.`),
+    state.capture ? null : el("div", { class: "warn" }, "Live calls aren't set up yet. In a terminal in the Tadween folder, run ",
+      el("code", {}, state.platform === "windows" ? "powershell -ExecutionPolicy Bypass -File setup.ps1" : "./setup.sh"), ", then reload this page."),
     field("Title", title),
     el("div", { class: "field" }, el("span", {}, "Listen to"),
       el("div", { class: "group" },
         source(mic, "Your microphone", "Labelled as you"),
         source(sys, "Call audio", "Everyone else on Zoom, Meet, Teams, Slack or any other app"))),
-    field("Only capture sound from this app", apps, "Leave empty to capture all sound. Open the meeting app before you start."),
+    mac() ? field("Only capture sound from this app", apps, "Leave empty to capture all sound. Open the meeting app before you start.") : null,
     go,
     el("p", { class: "note" },
-      el("b", {}, "First time? "), "macOS asks for Microphone and Screen & System Audio Recording permission for the app that runs Tadween (Terminal or VS Code). Allow both, then quit and reopen that app. ",
+      el("b", {}, "First time? "), {
+        mac: "macOS asks for Microphone and Screen & System Audio Recording permission for the app that runs Tadween (Terminal or VS Code). Allow both, then quit and reopen that app. ",
+        windows: "If your microphone stays silent, allow desktop apps to use it in Settings › Privacy & security › Microphone. ",
+        linux: "Tadween records your default microphone and what your default output plays (PulseAudio or PipeWire). ",
+      }[state.platform || "mac"],
       "Headphones give the cleanest result. When you press Stop, Tadween transcribes the whole call again with full context and regroups the voices for the final version.")));
 }
 
@@ -1004,8 +1013,8 @@ async function renderSettings() {
     el("div", { class: "group" },
       setting("Your name", "Used for your microphone in live calls.", name),
       setting("Language spoken in calls", null, lang),
-      setting("Transcription speed", "Faster decodes greedily: about a quarter quicker. It drops most filler words like “um” and may word a few phrases differently.", speed),
-      el("div", { class: "setting" }, el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Neural Engine"),
+      setting("Transcription speed", `Faster decodes greedily: ${mac() ? "about a quarter quicker" : "quicker with an NVIDIA GPU, but no quicker on a CPU alone"}. It drops most filler words like “um” and may word a few phrases differently.`, speed),
+      !mac() ? null : el("div", { class: "setting" }, el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Neural Engine"),
         el("span", { class: "setting-help" }, state.neuralEngine
           ? "On: Whisper's encoder runs on the Mac's Neural Engine, about 1.7× faster than the GPU on an M1."
           : state.neuralEngineInstalled
@@ -1013,7 +1022,7 @@ async function renderSettings() {
             : "Off. On Apple Silicon, run ./whisper/build.sh in the Tadween folder to transcribe about 1.7× faster.")),
         el("span", { class: `engine${state.neuralEngine ? " on" : ""}` }, state.neuralEngine ? "On" : "Off")),
       setting("Whisper style prompt", "A punctuated sentence Whisper imitates. Keep it short.", prompt),
-      setting("CPU threads", "For Whisper and voice recognition. Use your Mac's number of performance cores; restart Tadween after changing it.", threads)),
+      setting("CPU threads", "For Whisper and voice recognition. Use the number of performance cores this computer has; restart Tadween after changing it.", threads)),
     el("h2", {}, "Voices"),
     el("div", { class: "group" },
       setting("Voice grouping", "Applies to new transcripts. To regroup an existing one, use Speakers in its header.", scale(sep, "More speakers", "Fewer speakers"), true),
@@ -1112,6 +1121,7 @@ setInterval(tickClocks, 1000);
     state.settings = s.settings;
     state.live = s.live;
     state.capture = s.capture_helper;
+    state.platform = s.platform;
     state.neuralEngine = s.neural_engine;
     state.neuralEngineInstalled = s.neural_engine_installed;
     connectEvents();

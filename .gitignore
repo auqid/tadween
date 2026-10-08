@@ -13,5 +13,6 @@ data/
 capture/tadween-capture
 whisper/bin/
 whisper/src/
+tools/
 
 .DS_Store

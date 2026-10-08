@@ -4,20 +4,24 @@ import os
 import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 
+PLATFORM = "mac" if sys.platform == "darwin" else "windows" if os.name == "nt" else "linux"
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"
 WEB = ROOT / "web"
 DATA = Path(os.environ.get("TADWEEN_DATA", ROOT / "data"))
 TRANSCRIPTS = DATA / "transcripts"
-CAPTURE_BIN = ROOT / "capture" / "tadween-capture"
+CAPTURE_BIN = ROOT / "capture" / "tadween-capture"  # macOS live capture; Windows and Linux use tadween/capture.py
+TOOLS = ROOT / "tools"  # ffmpeg downloaded by setup.ps1 on Windows
 
 SAMPLE_RATE = 16000
 
 WHISPER_MODEL = MODELS / "ggml-large-v3-turbo-q8_0.bin"
 WHISPER_DTW_PRESET = "large.v3.turbo"
-# whisper.cpp built with Core ML by whisper/build.sh; it finds the encoder next to the model by name.
+# whisper.cpp built by whisper/build.sh (Core ML on a Mac, CUDA or CPU on Linux) or unpacked by setup.ps1 (Windows).
+# The Core ML build finds the encoder next to the model by name.
 WHISPER_BIN = ROOT / "whisper" / "bin"
 COREML_ENCODER = MODELS / "ggml-large-v3-turbo-encoder.mlmodelc"
 VAD_MODEL = MODELS / "silero_vad.onnx"
@@ -30,8 +34,9 @@ LANGUAGES = {"en": "English", "auto": "Detect automatically", "ar": "Arabic", "h
 DEFAULT_SETTINGS = {
     "my_name": "Me",
     "language": "en",
-    # Whisper runs on the GPU / Neural Engine; more CPU threads only compete with voice recognition (M1: 4 beat 6).
-    "threads": 4,
+    # On a Mac, Whisper runs on the GPU / Neural Engine and more CPU threads only compete with voice recognition
+    # (M1: 4 beat 6). Elsewhere Whisper may run on the CPU: one thread per core (half the logical CPUs), up to 8.
+    "threads": 4 if PLATFORM == "mac" else max(4, min(8, (os.cpu_count() or 8) // 2)),
     # Cosine distance for grouping voices: higher merges more voices together. 0.8 kept every known
     # speaker together and apart from the others, on 10-minute clips and an 80-minute call alike.
     "speaker_threshold": 0.8,
@@ -47,20 +52,26 @@ _lock = threading.Lock()
 SETTINGS_FILE = DATA / "settings.json"
 
 
+def _exe(folder, name):
+    for candidate in (folder / name, folder / f"{name}.exe"):
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return None
+
+
 def tool(name):
-    """Find a Homebrew binary even when PATH is minimal (e.g. launched from an app)."""
-    found = shutil.which(name)
+    """Find ffmpeg, whisper-cli and friends: on PATH, in Tadween's tools/ folder (Windows), or where Homebrew
+    puts them even when PATH is minimal (e.g. launched from an app)."""
+    found = shutil.which(name) or _exe(TOOLS, name)
+    for prefix in ("/opt/homebrew/bin", "/usr/local/bin"):
+        found = found or _exe(Path(prefix), name)
     if found:
         return found
-    for prefix in ("/opt/homebrew/bin", "/usr/local/bin"):
-        candidate = Path(prefix) / name
-        if candidate.exists():
-            return str(candidate)
-    raise FileNotFoundError(f"{name} not found - run ./setup.sh")
+    raise FileNotFoundError(f"{name} not found - run {'setup.ps1' if PLATFORM == 'windows' else './setup.sh'}")
 
 
 def neural_engine_installed():
-    return (WHISPER_BIN / "whisper-cli").exists() and COREML_ENCODER.exists()
+    return PLATFORM == "mac" and (WHISPER_BIN / "whisper-cli").exists() and COREML_ENCODER.exists()
 
 
 def neural_engine():
@@ -70,11 +81,11 @@ def neural_engine():
 
 
 def whisper_tool(name):
-    """whisper-cli or whisper-server: the Core ML build when installed, otherwise Homebrew's."""
-    local = WHISPER_BIN / name
-    if neural_engine() and local.exists():
-        return str(local.resolve())  # macOS caches the Neural Engine compile per program path
-    return tool(name)
+    """whisper-cli or whisper-server: our own build in whisper/bin, or else the one on PATH (Homebrew's on a Mac).
+    On a Mac whisper/bin holds the Core ML build, which is skipped when the Neural Engine is turned off."""
+    if PLATFORM == "mac" and not neural_engine():
+        return tool(name)
+    return _exe(WHISPER_BIN, name) or tool(name)  # resolved: macOS caches the Neural Engine compile per path
 
 
 def read_json(path, default):
@@ -99,7 +110,25 @@ def write_json(path, obj):
         f.write(json.dumps(obj, ensure_ascii=False))
         f.flush()
         os.fsync(f.fileno())  # on disk before it replaces the old file, even if power is lost
-    os.replace(tmp, path)
+    for attempt in range(40):
+        try:
+            return os.replace(tmp, path)
+        except PermissionError:  # Windows: someone is reading the old file right now
+            if PLATFORM != "windows" or attempt == 39:
+                raise
+            time.sleep(0.05)
+
+
+def remove(path):
+    """Delete a leftover file. On Windows a virus scanner can still have a new file open: retry for a moment,
+    then leave the file rather than fail the job over it."""
+    for _ in range(20):
+        try:
+            return Path(path).unlink(missing_ok=True)
+        except PermissionError:
+            if PLATFORM != "windows":
+                raise
+            time.sleep(0.05)
 
 
 def _valid(key, value):

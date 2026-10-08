@@ -1,6 +1,7 @@
 """Recording -> speaker-labelled transcript; also rebuilds it when voices are regrouped."""
+import atexit
 import difflib
-import fcntl
+import os
 import queue
 import shutil
 import subprocess
@@ -22,18 +23,43 @@ _data_lock = None  # held until this process exits
 on_progress = None  # optional callback(stage, fraction) - the CLI prints with it
 
 
-def hold_data_lock():
-    """Every running Tadween, app or command line, shares a lock on the data folder.
-    True if no other one holds it: then any unfinished work in there was cut short."""
-    global _data_lock
-    config.DATA.mkdir(parents=True, exist_ok=True)
-    _data_lock = open(config.DATA / ".lock", "w")
+def _lock(f, wait=True):
+    """Lock an open file until it's closed (or unlock with wait=None). False if another process holds it."""
     try:
-        fcntl.flock(_data_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        alone = True
-    except BlockingIOError:
-        alone = False
-    fcntl.flock(_data_lock, fcntl.LOCK_SH)
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK if wait is None else msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_UN if wait is None else fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def hold_data_lock():
+    """Every running Tadween, app or command line, holds a locked file in data/.running until it exits.
+    True if no other one is running: then any unfinished work in the data folder was cut short."""
+    global _data_lock
+    running = config.DATA / ".running"
+    running.mkdir(parents=True, exist_ok=True)
+    _data_lock = open(running / str(os.getpid()), "w")
+    _lock(_data_lock)
+    atexit.register(lambda: (_data_lock.close(), Path(_data_lock.name).unlink(missing_ok=True)))
+    alone = True
+    for other in running.iterdir():
+        if other.name == str(os.getpid()):
+            continue
+        try:
+            with open(other, "a") as f:
+                if not _lock(f, wait=False):
+                    alone = False  # that Tadween is still running
+                    continue
+                _lock(f, wait=None)
+            other.unlink()  # left by a Tadween that has gone
+        except OSError:
+            alone = False
     return alone
 
 
@@ -159,7 +185,7 @@ def process(tid):
             rebuild(t, settings=settings)
             _enroll_requested(t)
             t.update(status="ready", progress=None, error=None)
-        (d / "audio16k.wav").unlink(missing_ok=True)  # only analysis needs it: 115 MB per hour of audio
+        config.remove(d / "audio16k.wav")  # only analysis needs it: 115 MB per hour of audio
     except Exception as e:
         traceback.print_exc()
         store.update(tid, status="error", progress=None, error=f"{type(e).__name__}: {e}")
@@ -217,7 +243,7 @@ def _analyse_file(t, d, work, settings, progress):
     if playable:
         playable.result()
     if src.parent == d:
-        src.unlink(missing_ok=True)  # a browser upload, only needed until both copies exist
+        config.remove(src)  # a browser upload, only needed until both copies exist
     np.save(d / "embeddings.npy", found["E"])
     config.write_json(d / "windows.json", wins)
     config.write_json(d / "segments.json", segs)
@@ -267,7 +293,7 @@ def _live_tracks(d):
                 w.setframerate(config.SAMPLE_RATE)
                 while chunk := f.read(1 << 20):
                     w.writeframes(chunk)
-            pcm.unlink()
+            config.remove(pcm)
         if wav.exists():
             tracks.append(name)
     return tracks
