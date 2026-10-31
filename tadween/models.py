@@ -31,6 +31,8 @@ def fetch_small(progress=None):
                     events.emit("download", **state)
                     if progress:
                         progress(done / total)
+        if total and done != total:  # the connection closed early without an error: never keep half a model
+            raise OSError(f"the download stopped at {done * 100 // total}%")
         part.replace(dest)
         state.update(downloading=False, fraction=1.0)
     except Exception as e:

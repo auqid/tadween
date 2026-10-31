@@ -1047,11 +1047,10 @@ function speedText() {
 
 function speedRow() {
   const button = el("button", { id: "speed-check", disabled: state.speedChecking, onclick: async () => {
-    try {
-      await api("POST", "/api/speed-check");
-      Object.assign(state, { speedChecking: true, speedMessage: null, speedError: null });
-      updateSpeedRow();
-    } catch (e) { fail(e); }
+    // Before the request: its "speed" events (even an instant failure) may arrive before it returns.
+    Object.assign(state, { speedChecking: true, speedMessage: null, speedError: null });
+    updateSpeedRow();
+    try { await api("POST", "/api/speed-check"); } catch (e) { fail(e); refreshMachine(); }  // e.g. one already running: ask
   } }, state.speedChecking ? "Checking…" : state.speed ? "Check again" : "Check speed");
   return el("div", { class: "setting", id: "speed-row" },
     el("span", { class: "setting-text" }, el("span", { class: "setting-label" }, "Speed check"), el("span", { class: "setting-help", id: "speed-status" }, speedText())),

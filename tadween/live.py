@@ -168,6 +168,8 @@ class LiveSession:
             self.server = asr.WhisperServer(self.settings)
         except Exception:
             pipeline.live_active.clear()
+            for s in self.sources:  # their threads never ran to close them (and Windows can't delete open files)
+                s.raw.close()
             store.delete(self.id)
             raise
         self.t0 = time.monotonic()
