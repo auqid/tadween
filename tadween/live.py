@@ -289,10 +289,10 @@ class LiveSession:
         if not unnamed:
             return
         taken = {s.get("person") for s in self.speakers.values()}
-        for lab, (pid, name, score) in self.bank.match(unnamed, self.settings["voice_match_threshold"]).items():
-            if pid not in taken:
-                self.speakers[lab].update(name=name, person=pid, score=score)
-                events.emit("live_speakers", id=self.id, speakers=self.speakers)
+        for lab, (pid, name, score) in self.bank.match(unnamed, self.settings["voice_match_threshold"],
+                                                       exclude=taken).items():
+            self.speakers[lab].update(name=name, person=pid, score=score)
+            events.emit("live_speakers", id=self.id, speakers=self.speakers)
 
     def rename(self, label, name, remember=True):
         s = self.speakers[label]
