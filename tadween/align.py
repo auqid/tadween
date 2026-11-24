@@ -1,4 +1,6 @@
 """Give every word a speaker, then group words into readable speaker turns."""
+import bisect
+
 import numpy as np
 
 
@@ -95,28 +97,29 @@ def snap(words, labs, seg_of_word, reach=4):
     return labs
 
 
-def build_turns(segments, labs, max_seconds=90.0, max_gap=2.5):
-    """Split Whisper segments where the speaker changes, then join consecutive pieces of one speaker."""
+def build_turns(segments, labs, max_seconds=90.0, max_gap=2.5, breaks=()):
+    """Split Whisper segments where the speaker changes, then join consecutive pieces of one speaker.
+    breaks: times where another recording of a joined call starts. No line runs across one."""
     pieces, k = [], 0
     for seg in segments:
         current = None
         for w in seg["words"]:
-            lab = labs[k]
+            lab, part = labs[k], bisect.bisect_right(breaks, w["s"])
             k += 1
-            if current and current["speaker"] == lab:
+            if current and current["speaker"] == lab and current["part"] == part:
                 current["words"].append(w)
             else:
-                current = {"speaker": lab, "words": [w]}
+                current = {"speaker": lab, "part": part, "words": [w]}
                 pieces.append(current)
     turns = []
     for piece in pieces:
         last = turns[-1] if turns else None
-        if (last and last["speaker"] == piece["speaker"]
+        if (last and last["speaker"] == piece["speaker"] and last["part"] == piece["part"]
                 and piece["words"][0]["s"] - last["words"][-1]["e"] <= max_gap
                 and piece["words"][-1]["e"] - last["words"][0]["s"] <= max_seconds):
             last["words"] += piece["words"]
         else:
-            turns.append({"speaker": piece["speaker"], "words": list(piece["words"])})
+            turns.append({"speaker": piece["speaker"], "part": piece["part"], "words": list(piece["words"])})
     return [{"id": i + 1, "start": t["words"][0]["s"], "end": t["words"][-1]["e"], "speaker": t["speaker"],
              "text": "".join(w["w"] for w in t["words"]).strip(), "words": t["words"]}
             for i, t in enumerate(turns)]

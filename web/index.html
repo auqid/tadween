@@ -14,7 +14,7 @@
       <div class="side-actions">
         <a class="btn block" href="#/live" id="live-link"><span class="rec"></span><span id="live-label">Start live transcription</span><span id="live-time" class="num"></span></a>
         <label class="btn block">
-          <input type="file" id="file-input" class="visually-hidden" accept="audio/*,video/*,.m4a,.mp3,.mp4,.wav,.mov,.webm,.ogg,.flac">
+          <input type="file" id="file-input" class="visually-hidden" multiple accept="audio/*,video/*,.m4a,.mp3,.mp4,.wav,.mov,.webm,.ogg,.flac">
           Transcribe a recording…
         </label>
       </div>
@@ -38,7 +38,7 @@
       <div id="player-bar" hidden></div>
     </main>
   </div>
-  <div id="drop-overlay" hidden><div>Drop the recording to transcribe it</div></div>
+  <div id="drop-overlay" hidden><div>Drop recordings to transcribe them</div></div>
   <div id="fix-button" hidden></div>
   <div id="popover" hidden></div>
   <div id="toast-area" aria-live="polite"></div>

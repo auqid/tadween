@@ -206,16 +206,23 @@ def list_transcripts(h):
 
 @route("POST", "/api/transcripts/upload")
 def upload(h):
+    """One file as the body, or with ?parts=[{name, size}, …] several back to back, joined in that order."""
     length = int(h.headers.get("Content-Length") or 0)
     if not length:
         raise ValueError("Empty upload")
-    return {"id": pipeline.import_upload(h.rfile, length, h.query.get("name", "recording"), h.query.get("title"))}
+    if "parts" in h.query:
+        files = [(str(p["name"]), int(p["size"])) for p in json.loads(h.query["parts"])]
+        if not files or any(size <= 0 for _, size in files) or sum(size for _, size in files) != length:
+            raise ValueError("The upload's file sizes don't add up. Please try again.")
+    else:
+        files = [(h.query.get("name", "recording"), length)]
+    return {"id": pipeline.import_upload(h.rfile, files, h.query.get("title"))}
 
 
 @route("POST", "/api/transcripts/import")
 def import_path(h):
     b = h.body()
-    return {"id": pipeline.import_file(b["path"], b.get("title") or None)}
+    return {"id": pipeline.import_file(b.get("paths") or b["path"], b.get("title") or None)}
 
 
 @route("GET", f"/api/transcripts/{TID}")

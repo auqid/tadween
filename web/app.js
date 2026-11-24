@@ -214,8 +214,9 @@ function renderHome() {
       icon("upload"),
       el("strong", {}, "Drop a recording here, or choose a file"),
       el("span", { class: "muted" }, "Zoom, Meet and Teams recordings or voice memos: m4a, mp3, mp4, wav or mov"),
-      el("input", { type: "file", class: "visually-hidden", accept: "audio/*,video/*,.m4a,.mp3,.mp4,.wav,.mov,.webm,.ogg,.flac",
-        onchange: (e) => { if (e.target.files[0]) upload(e.target.files[0]); e.target.value = ""; } })),
+      el("span", { class: "muted" }, "Recorded a call in parts? Choose them all to join them into one transcript."),
+      el("input", { type: "file", class: "visually-hidden", multiple: true, accept: "audio/*,video/*,.m4a,.mp3,.mp4,.wav,.mov,.webm,.ogg,.flac",
+        onchange: (e) => { addFiles(e.target.files); e.target.value = ""; } })),
     el("div", { class: "or-live" },
       el("a", { class: "btn", href: "#/live" }, el("span", { class: "rec" }), "Start live transcription"),
       el("span", { class: "muted" }, "Your mic is labelled as you. The call audio is everyone else.")),
@@ -287,7 +288,8 @@ function renderTranscript(keepScroll = false) {
         el("div", { class: "row1" }, title,
           ready ? el("button", { onclick: exportMenu }, "Export") : null,
           t.status !== "live" && t.status !== "processing" ? el("button", { class: "ghost quiet-danger", onclick: remove }, "Delete") : null),
-        el("div", { class: "meta-line" }, el("span", {}, fmtDate(t.created)), el("span", {}, fmtDur(t.duration)), ready ? el("span", {}, plural(words, "word")) : null),
+        el("div", { class: "meta-line" }, el("span", {}, fmtDate(t.created)), el("span", {}, fmtDur(t.duration)), ready ? el("span", {}, plural(words, "word")) : null,
+          t.parts ? el("span", {}, `Joined from ${t.parts.length} recordings`) : null),
         statusEl(t),
         ready || t.turns.length ? el("div", { id: "speakers" }, speakersEl(t)) : null,
         ready ? toolbarEl() : null)),
@@ -358,8 +360,10 @@ function renderTurns() {
 function turnsEls(t) {
   const q = state.query.trim().toLowerCase();
   const out = [];
-  let prev = null, matches = 0;
+  let prev = null, matches = 0, part = 0;
+  const parts = q ? [] : t.parts || []; // a call joined from several recordings: mark where each one starts
   for (const turn of t.turns) {
+    while (part < parts.length && (part === 0 || turn.start >= parts[part].start)) { out.push(partBreakEl(parts[part], part + 1)); prev = null; part++; }
     if (q && !turn.text.toLowerCase().includes(q)) { prev = null; continue; }
     if (q) matches += turn.text.toLowerCase().split(q).length - 1;
     out.push(turnEl(t, turn, prev));
@@ -371,6 +375,8 @@ function turnsEls(t) {
   else if (q && !out.length) out.push(el("p", { class: "empty-turns" }, `Nothing in this transcript matches “${state.query.trim()}”.`));
   return out;
 }
+
+const partBreakEl = (p, n) => el("div", { class: "part-break" }, el("span", {}, `Part ${n}`), el("span", { class: "muted", title: p.name }, p.name));
 
 function turnEl(t, turn, prev) {
   const s = (t.speakers || {})[turn.speaker] || { name: turn.speaker || "…" };
@@ -670,7 +676,8 @@ function drawTimeline(t) {
   const d = t.duration || 1;
   const pct = (sec) => (100 * sec / d).toFixed(3);
   track.replaceChildren(...voiceRuns(t).map((r) => el("i", { class: "seg",
-    style: `--c:${color(r.speaker)};left:${pct(r.start)}%;width:max(1px, calc(${pct(r.end - r.start)}% - 2px))` })));
+    style: `--c:${color(r.speaker)};left:${pct(r.start)}%;width:max(1px, calc(${pct(r.end - r.start)}% - 2px))` })),
+  ...(t.parts || []).slice(1).map((p) => el("i", { class: "part-mark", style: `left:${pct(p.start)}%` })));
   $("#timeline .seek").max = t.duration || 0;
 }
 
@@ -757,17 +764,118 @@ function onTime(e) {
 
 // ---------- uploads ----------
 
-async function upload(file) {
-  const close = toast(`Uploading ${file.name}…`, [], { timeout: 0 });
+/** One file becomes one transcript. Several become one transcript too, joined in the order given. */
+async function upload(files, title = "") {
+  const one = files.length === 1;
+  const q = one ? `name=${encodeURIComponent(files[0].name)}`
+    : `parts=${encodeURIComponent(JSON.stringify(files.map((f) => ({ name: f.name, size: f.size }))))}`;
+  const close = toast(one ? `Uploading ${files[0].name}…` : `Uploading ${files.length} recordings to join…`, [], { timeout: 0 });
   try {
-    const r = await api("POST", `/api/transcripts/upload?name=${encodeURIComponent(file.name)}`, file);
+    const r = await api("POST", `/api/transcripts/upload?${q}&title=${encodeURIComponent(title)}`, one ? files[0] : new Blob(files));
     close();
     await loadList();
     location.hash = `#/t/${r.id}`;
   } catch (e) { close(); fail(e); }
 }
 
-$("#file-input").addEventListener("change", (e) => { if (e.target.files[0]) upload(e.target.files[0]); e.target.value = ""; });
+/** Files picked or dropped. One uploads straight away; several open the dialog that puts them in order. */
+function addFiles(fileList) {
+  const files = [...(fileList || [])];
+  if (!files.length) return;
+  if (state.joinDialog) return state.joinDialog.add(files);
+  if (files.length === 1) return upload(files);
+  joinDialog(files);
+}
+
+/** Length from the browser's own decoder, to help tell the parts apart. null if it can't tell (e.g. a streamed WebM). */
+const durationOf = (file) => new Promise((resolve) => {
+  const url = URL.createObjectURL(file), a = new Audio();
+  const done = (v) => { URL.revokeObjectURL(url); a.removeAttribute("src"); resolve(v); };
+  a.preload = "metadata";
+  a.onloadedmetadata = () => done(Number.isFinite(a.duration) ? a.duration : null);
+  a.onerror = () => done(null);
+  a.src = url;
+});
+
+const stem = (name) => name.replace(/\.[^.]+$/, "");
+const byTimeThenName = (a, b) => a.lastModified - b.lastModified || a.name.localeCompare(b.name, undefined, { numeric: true });
+
+function joinDialog(initial) {
+  let files = [...initial].sort(byTimeThenName);
+  const lengths = new Map();
+  let dragged = null;
+  const title = el("input", { type: "text", value: stem(files[0].name), "aria-label": "Title" });
+  let titleEdited = false;
+  title.addEventListener("input", () => { titleEdited = true; });
+  const list = el("ol", { class: "parts" });
+  const total = el("span", { class: "muted num" });
+
+  // After a redraw, keyboard focus goes back to the same control on the moved row, or the nearest one still there.
+  const refocus = (i, ...sels) => {
+    const row = list.children[Math.min(i, files.length - 1)];
+    (sels.map((s) => row?.querySelector(`${s}:not(:disabled)`)).find(Boolean) || dlg.querySelector(".primary")).focus();
+  };
+  const move = (from, to, ...focus) => {
+    if (to < 0 || to >= files.length || from === to) return;
+    const [f] = files.splice(from, 1);
+    files.splice(to, 0, f);
+    draw();
+    if (focus.length) refocus(to, ...focus);
+  };
+  const remove = (i) => { files.splice(i, 1); draw(); refocus(i, ".leave", ".down", ".up"); };
+  const heading = el("h2", { id: "join-title" });
+
+  function draw() {
+    heading.textContent = `Join ${files.length} recordings into one transcript?`;
+    if (!titleEdited) title.value = stem(files[0].name);
+    list.replaceChildren(...files.map((f, i) => {
+      const len = lengths.get(f);
+      return el("li", { class: "part", draggable: "true",
+        ondragstart: (e) => { dragged = i; e.dataTransfer.effectAllowed = "move"; e.currentTarget.classList.add("dragging"); },
+        ondragend: (e) => { dragged = null; e.currentTarget.classList.remove("dragging"); },
+        ondragover: (e) => { if (dragged !== null) { e.preventDefault(); e.dataTransfer.dropEffect = "move"; } },
+        ondrop: (e) => { if (dragged !== null) { e.preventDefault(); e.stopPropagation(); move(dragged, i); } } },
+        el("span", { class: "part-n num", "aria-hidden": "true" }, i + 1),
+        el("span", { class: "part-text" },
+          el("span", { class: "part-name", title: f.name }, f.name),
+          el("span", { class: "muted num" }, [len ? fmt(len) : null, `saved ${fmtDate(f.lastModified)}`].filter(Boolean).join(" · "))),
+        el("span", { class: "part-btns" },
+          el("button", { class: "icon-btn up", disabled: i === 0, "aria-label": `Move ${f.name} earlier`, title: "Earlier", onclick: () => move(i, i - 1, ".up", ".down") }, "↑"),
+          el("button", { class: "icon-btn down", disabled: i === files.length - 1, "aria-label": `Move ${f.name} later`, title: "Later", onclick: () => move(i, i + 1, ".down", ".up") }, "↓"),
+          files.length > 2 ? el("button", { class: "icon-btn leave", "aria-label": `Leave out ${f.name}`, title: "Leave out", onclick: () => remove(i) }, "✕") : null));
+    }));
+    const known = files.map((f) => lengths.get(f));
+    total.textContent = known.every(Boolean) ? `${fmtDur(known.reduce((a, b) => a + b, 0))} in all` : "";
+  }
+
+  const add = (more) => {
+    for (const f of more) if (!files.some((g) => g.name === f.name && g.size === f.size && g.lastModified === f.lastModified)) files.push(f);
+    measure(more);
+    draw();
+  };
+  const measure = (some) => some.forEach(async (f) => { if (!lengths.has(f)) { lengths.set(f, await durationOf(f)); draw(); } });
+
+  const dlg = el("dialog", { class: "dialog", "aria-labelledby": "join-title" },
+    heading,
+    el("p", { class: "muted" }, "Put the parts in the order they were recorded. Drag them, or use the arrows. They start out sorted by when each file was saved."),
+    list,
+    el("label", { class: "field" }, el("span", {}, "Title"), title),
+    el("div", { class: "dialog-foot" },
+      el("button", { class: "ghost", onclick: async () => { const all = files; close(); for (const f of all) await upload([f]); } }, "Transcribe separately"),
+      total,
+      el("button", { onclick: () => close() }, "Cancel"),
+      el("button", { class: "primary", onclick: () => { const all = files, t = title.value.trim(); close(); upload(all, t); } }, "Join and transcribe")));
+  const close = () => { state.joinDialog = null; if (dlg.open) dlg.close(); dlg.remove(); };
+  dlg.addEventListener("close", close);
+  state.joinDialog = { add };
+  document.body.append(dlg);
+  draw();
+  measure(files);
+  dlg.showModal();
+  dlg.querySelector(".primary").focus();
+}
+
+$("#file-input").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
 let dragDepth = 0;
 addEventListener("dragenter", (e) => { if (e.dataTransfer?.types.includes("Files")) { dragDepth++; $("#drop-overlay").hidden = false; } });
 addEventListener("dragleave", () => { if (--dragDepth <= 0) { dragDepth = 0; $("#drop-overlay").hidden = true; } });
@@ -776,8 +884,7 @@ addEventListener("drop", (e) => {
   e.preventDefault();
   dragDepth = 0;
   $("#drop-overlay").hidden = true;
-  const file = e.dataTransfer?.files?.[0];
-  if (file) upload(file);
+  addFiles(e.dataTransfer?.files);
 });
 
 // ---------- live ----------

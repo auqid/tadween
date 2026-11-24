@@ -7,6 +7,7 @@ Tadween transcribes Zoom, Meet, Teams or any other calls, live or from a recordi
 ## What it does
 
 - **Transcribe recordings.** Drop in an `.m4a`, `.mp3`, `.mp4`, `.mov` or `.wav` file. It gets a timestamped transcript split into speaker turns.
+- **Join a call recorded in parts.** Choose or drop several files and put them in order. Tadween joins them into one transcript, so speakers keep the same names throughout, and marks where each part starts.
 - **Live calls.** Your microphone is labelled as you, and the computer's sound output (everyone else) is split by voice as people talk. When you stop, the whole call is transcribed again with full context and the voices are regrouped, so the saved transcript is as good as a recording's. This works with any meeting app, because it captures audio rather than reading a web page.
 - **Names that stick.** Click *Speaker 3*, type "Sara", and keep "remember this voice" ticked. Tadween stores a voiceprint (a vector describing the voice, not audio) and labels Sara automatically in later calls.
 - **Fix once, fixed everywhere.** Edit a word, or select it and click *Fix everywhere*. Tadween shows how often it occurs and replaces every occurrence. Remembered fixes are applied to future transcripts and also passed to Whisper, so it spells the word correctly to begin with.
@@ -168,6 +169,7 @@ Intel Macs have no Neural Engine, so setup skips that step and transcription is 
 ```bash
 ./tadween.sh transcribe "Team sync.m4a"                # writes "Team sync - transcript.txt" next to it
 ./tadween.sh transcribe call.mp4 --speakers 5 --format md
+./tadween.sh transcribe "Sync 1.m4a" "Sync 2.m4a"     # parts of one call, joined in this order
 ./tadween.sh speed-check                               # time Whisper on each engine here; Automatic then uses the fastest
 ```
 

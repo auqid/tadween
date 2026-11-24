@@ -85,41 +85,66 @@ def _work():
             traceback.print_exc()
 
 
-def import_file(path, title=None, queue_job=True):
-    path = Path(path).expanduser().resolve()
-    try:
-        duration, _ = audio.probe(path)
-    except subprocess.CalledProcessError as e:  # ffprobe says why, e.g. "No such file or directory"
-        raise ValueError(f"Can't read {path.name}: {e.stderr.strip().rsplit(': ', 1)[-1]}")
-    t = store.create(title or path.stem, kind="file", duration=round(duration, 2),
-                     source_name=path.name, source_path=str(path))
+def _probe_parts(paths, names):
+    """Where each recording will start once they're joined, in order. Raises ValueError naming a file it can't read."""
+    parts, start = [], 0.0
+    for path, name in zip(paths, names):
+        try:
+            duration, _ = audio.probe(path)
+        except subprocess.CalledProcessError as e:  # ffprobe says why, e.g. "No such file or directory"
+            raise ValueError(f"Can't read {name}: {e.stderr.strip().rsplit(': ', 1)[-1]}")
+        except ValueError:
+            raise ValueError(f"{name} has no audio track Tadween can read.")
+        if not audio.decodes(path, seconds=60):  # a fraction of a second; damage further in is caught by the job
+            raise audio.damaged([name])
+        parts.append({"name": name, "path": str(path), "start": round(start, 2), "duration": round(duration, 2)})
+        start += duration
+    return parts
+
+
+def _source_fields(d, parts):
+    """One recording is transcribed as it is. Several are joined into d/joined.flac first, by the job."""
+    if len(parts) == 1:
+        return {"duration": parts[0]["duration"], "source_path": parts[0]["path"]}
+    return {"duration": round(sum(p["duration"] for p in parts), 2), "source_path": str(d / "joined.flac"),
+            "parts": parts}
+
+
+def import_file(paths, title=None, queue_job=True):
+    """A recording on disk, or a list of them: parts of one call, joined in that order into one transcript."""
+    paths = [Path(p).expanduser().resolve() for p in (paths if isinstance(paths, (list, tuple)) else [paths])]
+    parts = _probe_parts(paths, [p.name for p in paths])
+    t = store.create(title or paths[0].stem, kind="file", source_name=" + ".join(p.name for p in paths))
+    store.update(t["id"], **_source_fields(store.folder(t["id"]), parts))
     if queue_job:
         _jobs.put(t["id"])
     events.emit("transcripts")
     return t["id"]
 
 
-def import_upload(stream, length, filename, title=None):
-    t = store.create(title or Path(filename).stem, kind="file", source_name=filename)
-    dst = store.folder(t["id"]) / ("upload" + Path(filename).suffix.lower()[:8])
+def import_upload(stream, files, title=None):
+    """files: [(filename, size)], sent back to back in one request body. Several are parts of one call,
+    joined in the order sent."""
+    names = [name for name, _ in files]
+    t = store.create(title or Path(names[0]).stem, kind="file", source_name=" + ".join(names))
+    d = store.folder(t["id"])
+    stems = ["upload"] if len(files) == 1 else [f"part{i + 1}" for i in range(len(files))]
+    paths = [d / (stem + Path(name).suffix.lower()[:8]) for stem, name in zip(stems, names)]
     try:
-        with open(dst, "wb") as f:
-            left = length
-            while left > 0:
-                chunk = stream.read(min(left, 1 << 20))
-                if not chunk:
-                    raise ValueError("The upload was interrupted. Please try again.")
-                f.write(chunk)
-                left -= len(chunk)
-    except Exception:  # cut short, connection lost or disk full: leave nothing half-made behind
+        for (_, size), dst in zip(files, paths):
+            with open(dst, "wb") as f:
+                left = size
+                while left > 0:
+                    chunk = stream.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise ValueError("The upload was interrupted. Please try again.")
+                    f.write(chunk)
+                    left -= len(chunk)
+        parts = _probe_parts(paths, names)
+    except Exception:  # cut short, connection lost, disk full or not audio: leave nothing half-made behind
         store.delete(t["id"])
         raise
-    try:
-        duration, _ = audio.probe(dst)
-    except Exception:
-        store.delete(t["id"])
-        raise ValueError("That file has no audio track Tadween can read.")
-    store.update(t["id"], duration=round(duration, 2), source_path=str(dst))
+    store.update(t["id"], **_source_fields(d, parts))
     _jobs.put(t["id"])
     events.emit("transcripts")
     return t["id"]
@@ -188,7 +213,8 @@ def process(tid):
         config.remove(d / "audio16k.wav")  # only analysis needs it: 115 MB per hour of audio
     except Exception as e:
         traceback.print_exc()
-        store.update(tid, status="error", progress=None, error=f"{type(e).__name__}: {e}")
+        message = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"  # ValueErrors are worded for people
+        store.update(tid, status="error", progress=None, error=message)
     finally:
         shutil.rmtree(work, ignore_errors=True)
         events.emit("transcripts")
@@ -197,11 +223,28 @@ def process(tid):
 
 def _analyse_file(t, d, work, settings, progress):
     src = Path(t["source_path"])
+    parts = t.get("parts") or []
+    if parts and not src.exists() and all(Path(p["path"]).exists() for p in parts):
+        progress("Joining recordings", 0.0)
+        try:
+            audio.join([p["path"] for p in parts], src)
+        except subprocess.CalledProcessError:
+            if bad := [p["name"] for p in parts if not audio.decodes(p["path"])]:
+                raise audio.damaged(bad)
+            raise
+        for p in parts:
+            if Path(p["path"]).parent == d:
+                config.remove(p["path"])  # uploaded parts: the joined copy replaces them
     progress("Preparing audio", 0.0)
     wav = d / "audio16k.wav"
     playable = None
     if src.exists() or not (wav.exists() and (d / "audio.m4a").exists()):  # a retried upload is converted already
-        audio.to_wav16k(src, wav)
+        try:
+            audio.to_wav16k(src, wav)
+        except subprocess.CalledProcessError:
+            if not audio.decodes(src):
+                raise audio.damaged([t.get("source_name") or src.name])
+            raise
         playable = Background(audio.make_playable, src, d)  # the player's copy is made while Whisper works
     x = audio.read_wav(wav)
     regions = vad.speech_regions(x, progress=lambda f: progress("Finding speech", f))
@@ -373,7 +416,8 @@ def rebuild(t, num_speakers=None, settings=None):
             k += len(s["words"])
         pieces += [(s, [s["fixed"]] * len(s["words"])) for s in fixed]
         pieces.sort(key=lambda p: p[0]["start"])
-        turns = align.build_turns([s for s, _ in pieces], [lab for _, ls in pieces for lab in ls])
+        turns = align.build_turns([s for s, _ in pieces], [lab for _, ls in pieces for lab in ls],
+                                  breaks=[p["start"] for p in t.get("parts", [])[1:]])
         key, n = {}, 0
         for lab in dict.fromkeys(turn["speaker"] for turn in turns):
             if isinstance(lab, str):
