@@ -85,41 +85,66 @@ def _work():
             traceback.print_exc()
 
 
-def import_file(path, title=None, queue_job=True):
-    path = Path(path).expanduser().resolve()
-    try:
-        duration, _ = audio.probe(path)
-    except subprocess.CalledProcessError as e:  # ffprobe says why, e.g. "No such file or directory"
-        raise ValueError(f"Can't read {path.name}: {e.stderr.strip().rsplit(': ', 1)[-1]}")
-    t = store.create(title or path.stem, kind="file", duration=round(duration, 2),
-                     source_name=path.name, source_path=str(path))
+def _probe_parts(paths, names):
+    """Where each recording will start once they're joined, in order. Raises ValueError naming a file it can't read."""
+    parts, start = [], 0.0
+    for path, name in zip(paths, names):
+        try:
+            duration, _ = audio.probe(path)
+        except subprocess.CalledProcessError as e:  # ffprobe says why, e.g. "No such file or directory"
+            raise ValueError(f"Can't read {name}: {e.stderr.strip().rsplit(': ', 1)[-1]}")
+        except ValueError:
+            raise ValueError(f"{name} has no audio track Tadween can read.")
+        if not audio.decodes(path, seconds=60):  # a fraction of a second; damage further in is caught by the job
+            raise audio.damaged([name])
+        parts.append({"name": name, "path": str(path), "start": round(start, 2), "duration": round(duration, 2)})
+        start += duration
+    return parts
+
+
+def _source_fields(d, parts):
+    """One recording is transcribed as it is. Several are joined into d/joined.flac first, by the job."""
+    if len(parts) == 1:
+        return {"duration": parts[0]["duration"], "source_path": parts[0]["path"]}
+    return {"duration": round(sum(p["duration"] for p in parts), 2), "source_path": str(d / "joined.flac"),
+            "parts": parts}
+
+
+def import_file(paths, title=None, queue_job=True):
+    """A recording on disk, or a list of them: parts of one call, joined in that order into one transcript."""
+    paths = [Path(p).expanduser().resolve() for p in (paths if isinstance(paths, (list, tuple)) else [paths])]
+    parts = _probe_parts(paths, [p.name for p in paths])
+    t = store.create(title or paths[0].stem, kind="file", source_name=" + ".join(p.name for p in paths))
+    store.update(t["id"], **_source_fields(store.folder(t["id"]), parts))
     if queue_job:
         _jobs.put(t["id"])
     events.emit("transcripts")
     return t["id"]
 
 
-def import_upload(stream, length, filename, title=None):
-    t = store.create(title or Path(filename).stem, kind="file", source_name=filename)
-    dst = store.folder(t["id"]) / ("upload" + Path(filename).suffix.lower()[:8])
+def import_upload(stream, files, title=None):
+    """files: [(filename, size)], sent back to back in one request body. Several are parts of one call,
+    joined in the order sent."""
+    names = [name for name, _ in files]
+    t = store.create(title or Path(names[0]).stem, kind="file", source_name=" + ".join(names))
+    d = store.folder(t["id"])
+    stems = ["upload"] if len(files) == 1 else [f"part{i + 1}" for i in range(len(files))]
+    paths = [d / (stem + Path(name).suffix.lower()[:8]) for stem, name in zip(stems, names)]
     try:
-        with open(dst, "wb") as f:
-            left = length
-            while left > 0:
-                chunk = stream.read(min(left, 1 << 20))
-                if not chunk:
-                    raise ValueError("The upload was interrupted. Please try again.")
-                f.write(chunk)
-                left -= len(chunk)
-    except Exception:  # cut short, connection lost or disk full: leave nothing half-made behind
+        for (_, size), dst in zip(files, paths):
+            with open(dst, "wb") as f:
+                left = size
+                while left > 0:
+                    chunk = stream.read(min(left, 1 << 20))
+                    if not chunk:
+                        raise ValueError("The upload was interrupted. Please try again.")
+                    f.write(chunk)
+                    left -= len(chunk)
+        parts = _probe_parts(paths, names)
+    except Exception:  # cut short, connection lost, disk full or not audio: leave nothing half-made behind
         store.delete(t["id"])
         raise
-    try:
-        duration, _ = audio.probe(dst)
-    except Exception:
-        store.delete(t["id"])
-        raise ValueError("That file has no audio track Tadween can read.")
-    store.update(t["id"], duration=round(duration, 2), source_path=str(dst))
+    store.update(t["id"], **_source_fields(d, parts))
     _jobs.put(t["id"])
     events.emit("transcripts")
     return t["id"]
@@ -188,7 +213,8 @@ def process(tid):
         config.remove(d / "audio16k.wav")  # only analysis needs it: 115 MB per hour of audio
     except Exception as e:
         traceback.print_exc()
-        store.update(tid, status="error", progress=None, error=f"{type(e).__name__}: {e}")
+        message = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"  # ValueErrors are worded for people
+        store.update(tid, status="error", progress=None, error=message)
     finally:
         shutil.rmtree(work, ignore_errors=True)
         events.emit("transcripts")
@@ -197,11 +223,28 @@ def process(tid):
 
 def _analyse_file(t, d, work, settings, progress):
     src = Path(t["source_path"])
+    parts = t.get("parts") or []
+    if parts and not src.exists() and all(Path(p["path"]).exists() for p in parts):
+        progress("Joining recordings", 0.0)
+        try:
+            audio.join([p["path"] for p in parts], src)
+        except subprocess.CalledProcessError:
+            if bad := [p["name"] for p in parts if not audio.decodes(p["path"])]:
+                raise audio.damaged(bad)
+            raise
+        for p in parts:
+            if Path(p["path"]).parent == d:
+                config.remove(p["path"])  # uploaded parts: the joined copy replaces them
     progress("Preparing audio", 0.0)
     wav = d / "audio16k.wav"
     playable = None
     if src.exists() or not (wav.exists() and (d / "audio.m4a").exists()):  # a retried upload is converted already
-        audio.to_wav16k(src, wav)
+        try:
+            audio.to_wav16k(src, wav)
+        except subprocess.CalledProcessError:
+            if not audio.decodes(src):
+                raise audio.damaged([t.get("source_name") or src.name])
+            raise
         playable = Background(audio.make_playable, src, d)  # the player's copy is made while Whisper works
     x = audio.read_wav(wav)
     regions = vad.speech_regions(x, progress=lambda f: progress("Finding speech", f))
@@ -360,29 +403,46 @@ def rebuild(t, num_speakers=None, settings=None):
 
     words = [w for s in free for w in s["words"]]
     seg_of_word = [i for i, s in enumerate(free) for _ in s["words"]]
-    labs = align.word_speakers(words, wins, labels) if words else []
-    labs = align.snap(words, align.smooth(words, labs, seg_of_word), seg_of_word) if words else []
-    # One time-ordered pass over both tracks, so a line is only joined to the same speaker's previous one
-    # when nobody else spoke in between.
-    pieces, k = [], 0
-    for s in free:
-        pieces.append((s, labs[k:k + len(s["words"])]))
-        k += len(s["words"])
-    pieces += [(s, [s["fixed"]] * len(s["words"])) for s in fixed]
-    pieces.sort(key=lambda p: p[0]["start"])
-    turns = align.build_turns([s for s, _ in pieces], [lab for _, ls in pieces for lab in ls])
 
-    order = list(dict.fromkeys(turn["speaker"] for turn in turns))
-    key, n = {}, 0
-    for lab in order:
-        if isinstance(lab, str):
-            key[lab] = lab
-        else:
-            n += 1
-            key[lab] = f"S{n}"
+    def layout(labels):
+        """Voice groups -> (turns, {group: S1, S2.. by first appearance}, names carried over, labels they moved)."""
+        labs = align.word_speakers(words, wins, labels) if words else []
+        labs = align.snap(words, align.smooth(words, labs, seg_of_word), seg_of_word) if words else []
+        # One time-ordered pass over both tracks, so a line is only joined to the same speaker's previous one
+        # when nobody else spoke in between.
+        pieces, k = [], 0
+        for s in free:
+            pieces.append((s, labs[k:k + len(s["words"])]))
+            k += len(s["words"])
+        pieces += [(s, [s["fixed"]] * len(s["words"])) for s in fixed]
+        pieces.sort(key=lambda p: p[0]["start"])
+        turns = align.build_turns([s for s, _ in pieces], [lab for _, ls in pieces for lab in ls],
+                                  breaks=[p["start"] for p in t.get("parts", [])[1:]])
+        key, n = {}, 0
+        for lab in dict.fromkeys(turn["speaker"] for turn in turns):
+            if isinstance(lab, str):
+                key[lab] = lab
+            else:
+                n += 1
+                key[lab] = f"S{n}"
+        return turns, key, *_inherit_names(t, turns, key)
+
+    turns, key, inherited, moved = layout(labels)
     cents = speakers.centroids(E, labels) if wins else {}
-    matches = bank.match({lab: cents[lab] for lab in order if lab in cents}, settings["voice_match_threshold"])
-    inherited = _inherit_names(t, turns, key)
+    # Left to count the voices itself, the grouping sometimes splits one person in two (another mic, a bad line):
+    # a group that clearly sounds like a remembered person already found in the call joins their group, unless
+    # either was given another name by hand. Not when you set the count.
+    matches = bank.match({lab: cents[lab] for lab in key if lab in cents}, settings["voice_match_threshold"],
+                         splits=not num_speakers)
+    first, join = {}, {}
+    for lab, (pid, name, _) in matches.items():  # pairs come first: the paired group keeps its label
+        to = first.setdefault(pid, lab)
+        if to != lab and all(inherited.get(key[x], {}).get("name", name).casefold() == name.casefold() for x in (lab, to)):
+            join[lab] = to
+    matches = {lab: m for lab, m in matches.items() if first[m[0]] == lab}
+    if join:
+        turns, key, inherited, moved = layout(np.array([join.get(int(lab), int(lab)) for lab in labels]))
+    order = list(key)
     talk = Counter()
     for turn in turns:
         talk[turn["speaker"]] += turn["end"] - turn["start"]
@@ -396,7 +456,6 @@ def rebuild(t, num_speakers=None, settings=None):
             s["person"], s["name"], s["score"] = matches[lab]
         s.update(inherited.get(k, {}))
         spk[k] = s
-    config.write_json(d / "centroids.json", {key[lab]: cents[lab].tolist() for lab in order if lab in cents})
 
     for turn in turns:
         turn["speaker"] = key[turn["speaker"]]
@@ -406,14 +465,40 @@ def rebuild(t, num_speakers=None, settings=None):
         if fired:
             turn["autofix"] = fired
     t.update(speakers=spk, turns=turns, num_speakers=num_speakers)
+    if bank.has_from(t["id"]):  # voiceprints saved from the old speakers go with their names
+        bank.regrouped(t["id"], moved, voiceprints(t, set(moved.values())))
     return t
 
 
+def voiceprints(t, labels):
+    """Speakers' voiceprints {label: voice}: the average of the voice windows inside their lines, so they follow
+    lines moved by hand, minus any overlapping your mic in a live call (those windows hold the call audio, not
+    them). None when no window fits inside their lines: not enough of their voice."""
+    d = store.folder(t["id"])
+    wins = np.array(config.read_json(d / "windows.json", []), float).reshape(-1, 2)
+    mic = np.array([(s["start"], s["end"]) for s in config.read_json(d / "segments.json", []) if s.get("fixed")],
+                   float).reshape(-1, 2)
+    off_mic = ~((wins[:, :1] < mic[:, 1]) & (mic[:, 0] < wins[:, 1:])).any(1)
+    E, out = None, {}
+    for label in labels:
+        lines = np.array([(x["start"], x["end"]) for x in t["turns"] if x["speaker"] == label], float).reshape(-1, 2)
+        pick = np.flatnonzero(((lines[:, 0] <= wins[:, :1]) & (wins[:, 1:] <= lines[:, 1])).any(1) & off_mic)
+        if len(pick) and E is None:
+            E = np.load(d / "embeddings.npy")
+        out[label] = speakers.unit(speakers.unit(E[pick]).mean(0)) if len(pick) else None
+    return out
+
+
+def voice(t, label):
+    return voiceprints(t, [label])[label]
+
+
 def _inherit_names(old, new_turns, key):
-    """When voices are regrouped, names the user gave carry over to the group covering the same speech."""
+    """When voices are regrouped, names the user gave carry over to the group covering the same speech.
+    -> ({new label: name fields}, {old label: new label})"""
     named = {lab: s for lab, s in old.get("speakers", {}).items() if s.get("manual") and lab != "ME"}
     if not named or not old.get("turns"):
-        return {}
+        return {}, {}
     who = lambda lab: named[lab]["name"].casefold()  # noqa: E731 - one person may have been split into several labels
     overlap, old_talk, new_talk, best = Counter(), Counter(), Counter(), {}
     for ot in old["turns"]:
@@ -427,25 +512,28 @@ def _inherit_names(old, new_turns, key):
                 if ov > 0:
                     overlap[(key[nt["speaker"]], who(ot["speaker"]))] += ov
     for lab in sorted(named, key=lambda lab: -sum(t["end"] - t["start"] for t in old["turns"] if t["speaker"] == lab)):
-        best.setdefault(who(lab), named[lab])  # the label with the most speech speaks for that name
-    out, used = {}, set()
+        best.setdefault(who(lab), lab)  # the label with the most speech speaks for that name
+    out, moved, used = {}, {}, set()
     for (new, person), ov in overlap.most_common():
         if new in out or person in used or new == "ME":
             continue
         used.add(person)  # a name goes to its best group or nowhere - never on to a weaker one
         if ov >= 0.5 * new_talk[new] or ov >= 0.5 * old_talk[person]:
-            out[new] = {k: best[person][k] for k in ("name", "person", "manual", "remember") if k in best[person]}
-    return out
+            s = named[best[person]]
+            out[new] = {k: s[k] for k in ("name", "person", "manual", "remember") if k in s}
+            moved[best[person]] = new
+    return out, moved
 
 
 def _enroll_requested(t):
     """Speakers named with "remember this voice" during a live call get enrolled once grouping is final."""
-    cents = config.read_json(store.folder(t["id"]) / "centroids.json", {})
-    bank = None
-    for k, s in t["speakers"].items():
-        if s.pop("remember", False) and k in cents:
-            bank = bank or speakers.VoiceBank()
-            s["person"] = bank.enroll(s["name"], np.array(cents[k], np.float32))
+    wanted = [k for k, s in t["speakers"].items() if s.pop("remember", False)]
+    if not wanted:
+        return
+    bank = speakers.VoiceBank()
+    for k, vec in voiceprints(t, wanted).items():
+        if vec is not None:
+            t["speakers"][k]["person"] = bank.enroll(t["speakers"][k]["name"], vec, f"{t['id']}/{k}")
 
 
 def regroup(tid, num_speakers=None):

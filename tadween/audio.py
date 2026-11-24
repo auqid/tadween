@@ -41,6 +41,46 @@ def to_wav16k(src, dst):
         check=True)
 
 
+def join(srcs, dst):
+    """Recordings one after another as one lossless FLAC, in the order given. Each is brought to the same rate and
+    channels first, so a phone memo can follow a Zoom recording. Written aside and renamed, so a cut-short join
+    never looks finished."""
+    n = len(srcs)
+    inputs = [arg for s in srcs for arg in ("-i", str(s))]
+    # The same late-start padding as to_wav16k, per part, so word times stay on the player's clock.
+    each = "".join(f"[{i}:a:0]aresample=48000:async=1:first_pts=0:min_hard_comp=86400,"
+                   f"aformat=sample_fmts=s16:channel_layouts=stereo[a{i}];" for i in range(n))
+    graph = each + "".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[out]"
+    tmp = Path(dst).with_name(Path(dst).name + ".tmp")
+    try:
+        subprocess.run(
+            [config.tool("ffmpeg"), "-nostdin", "-loglevel", "error", "-y", *inputs,
+             "-filter_complex", graph, "-map", "[out]", "-c:a", "flac", "-f", "flac", str(tmp)],
+            capture_output=True, check=True)
+    except Exception:
+        config.remove(tmp)  # can be most of a gigabyte
+        raise
+    tmp.replace(dst)
+    return dst
+
+
+def decodes(src, seconds=None):
+    """False if ffmpeg can't decode most of the audio, e.g. the file's index doesn't match its audio data.
+    ffmpeg fails then (by default, when over 2/3 of the frames are bad) rather than give out noise.
+    seconds: only check the start, a quick test at import."""
+    limit = ["-t", str(seconds)] if seconds else []
+    return subprocess.run(
+        [config.tool("ffmpeg"), "-nostdin", "-loglevel", "quiet", "-i", str(src), *limit, "-map", "0:a:0",
+         "-f", "null", "-"]).returncode == 0
+
+
+def damaged(names):
+    one = len(names) == 1
+    return ValueError(f"{' and '.join(names)} {'is' if one else 'are'} damaged: most of {'its' if one else 'their'} "
+                      f"audio can't be decoded. Try exporting or copying "
+                      f"{'it' if one else 'them'} from the recorder again.")
+
+
 def make_playable(src, dst_dir):
     """An .m4a the browser can play and seek; copies AAC without re-encoding. A list of tracks is mixed."""
     dst = Path(dst_dir) / "audio.m4a"

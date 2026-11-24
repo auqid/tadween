@@ -3,6 +3,7 @@ import json
 import mimetypes
 import queue
 import re
+import socket
 import threading
 import traceback
 import webbrowser
@@ -205,16 +206,23 @@ def list_transcripts(h):
 
 @route("POST", "/api/transcripts/upload")
 def upload(h):
+    """One file as the body, or with ?parts=[{name, size}, …] several back to back, joined in that order."""
     length = int(h.headers.get("Content-Length") or 0)
     if not length:
         raise ValueError("Empty upload")
-    return {"id": pipeline.import_upload(h.rfile, length, h.query.get("name", "recording"), h.query.get("title"))}
+    if "parts" in h.query:
+        files = [(str(p["name"]), int(p["size"])) for p in json.loads(h.query["parts"])]
+        if not files or any(size <= 0 for _, size in files) or sum(size for _, size in files) != length:
+            raise ValueError("The upload's file sizes don't add up. Please try again.")
+    else:
+        files = [(h.query.get("name", "recording"), length)]
+    return {"id": pipeline.import_upload(h.rfile, files, h.query.get("title"))}
 
 
 @route("POST", "/api/transcripts/import")
 def import_path(h):
     b = h.body()
-    return {"id": pipeline.import_file(b["path"], b.get("title") or None)}
+    return {"id": pipeline.import_file(b.get("paths") or b["path"], b.get("title") or None)}
 
 
 @route("GET", f"/api/transcripts/{TID}")
@@ -396,10 +404,21 @@ def live_rename(h, label):
     return live.rename(label, b.get("name", ""), b.get("remember", True))
 
 
+class Server(ThreadingHTTPServer):
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):  # Windows
+        # There SO_REUSEADDR (Python's default for HTTP servers) lets a second program take the same port, so a
+        # second Tadween would start beside the first instead of saying it's already running.
+        allow_reuse_address = False
+
+        def server_bind(self):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+
 def run(port=8765, open_browser=True):
     config.TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        server = Server(("127.0.0.1", port), Handler)
     except OSError:
         raise SystemExit(f"Port {port} is busy - is Tadween already running? Try --port {port + 1}.")
     pipeline.start()  # only once the port is ours: a launch that can't run must not touch the running app's work

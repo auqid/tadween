@@ -7,6 +7,7 @@ Tadween transcribes Zoom, Meet, Teams or any other calls, live or from a recordi
 ## What it does
 
 - **Transcribe recordings.** Drop in an `.m4a`, `.mp3`, `.mp4`, `.mov` or `.wav` file. It gets a timestamped transcript split into speaker turns.
+- **Join a call recorded in parts.** Choose or drop several files and put them in order. Tadween joins them into one transcript, so speakers keep the same names throughout, and marks where each part starts.
 - **Live calls.** Your microphone is labelled as you, and the computer's sound output (everyone else) is split by voice as people talk. When you stop, the whole call is transcribed again with full context and the voices are regrouped, so the saved transcript is as good as a recording's. This works with any meeting app, because it captures audio rather than reading a web page.
 - **Names that stick.** Click *Speaker 3*, type "Sara", and keep "remember this voice" ticked. Tadween stores a voiceprint (a vector describing the voice, not audio) and labels Sara automatically in later calls.
 - **Fix once, fixed everywhere.** Edit a word, or select it and click *Fix everywhere*. Tadween shows how often it occurs and replaces every occurrence. Remembered fixes are applied to future transcripts and also passed to Whisper, so it spells the word correctly to begin with.
@@ -30,7 +31,8 @@ audio ─► Silero VAD ─► speech only ─► whisper.cpp large-v3-turbo (Ne
 ```
 
 - **Silence removal.** Whisper only sees speech, because it hallucinates during long silences. Repetition loops, a known Whisper failure, are detected and transcribed again without carried-over context.
-- **Voice grouping.** Voices are grouped by clustering TitaNet embeddings, with a time-smoothing pass so the speaker doesn't flip mid-sentence. Speaker changes then snap to the nearest sentence end. TitaNet was chosen after testing on a real team call: it separated speakers far better than CAM++ or ResNet34. Voiceprints are compared as-is, so a voice saved from one call matches the same person in the next.
+- **Voice grouping.** Voices are grouped by clustering TitaNet embeddings, with a time-smoothing pass so the speaker doesn't flip mid-sentence. Speaker changes then snap to the nearest sentence end. TitaNet was chosen after testing on a real team call: it separated speakers far better than CAM++ or ResNet34. Voiceprints are compared as-is, so a voice saved from one call matches the same person in the next. Remembered voices also mend the grouping: when it splits one person in two (a second mic, a bad connection), both halves that clearly sound like the same remembered person become one speaker.
+- **Remembered voices stay correct.** Each voiceprint records the speaker it was saved from. Rename that speaker and the old name loses the voice; move lines to or from them, or merge speakers, and the voiceprint follows. A voice once saved under the wrong name doesn't keep pulling that name onto someone else.
 - **Live mode.** On a Mac, audio comes from a small Swift helper ([capture/](capture/)): ScreenCaptureKit for system audio and AVAudioEngine for the mic. On Windows and Linux it comes from [tadween/capture.py](tadween/capture.py), using the soundcard package: a loopback of the speakers (WASAPI) on Windows, the speakers' monitor (PulseAudio or PipeWire) on Linux. Snippets go to a resident `whisper-server`. Whisper takes as long for a short snippet as for 30 seconds of audio, so when a computer without a GPU falls behind, the snippets waiting are sent together and it catches up.
 - **Neural Engine.** On a Mac, `setup.sh` builds whisper.cpp with Core ML ([whisper/build.sh](whisper/build.sh)), so Whisper's encoder runs on the Apple Neural Engine instead of the GPU. Without it, Tadween uses Homebrew's whisper-cpp.
 - **Windows and Linux.** Setup downloads (Windows) or builds (Linux) whisper.cpp for the computer: with CUDA for an NVIDIA GPU, with Vulkan for AMD and Intel GPUs, otherwise for the CPU. Every platform uses the same whisper.cpp release, set in [whisper/RELEASE](whisper/RELEASE).
@@ -167,6 +169,7 @@ Intel Macs have no Neural Engine, so setup skips that step and transcription is 
 ```bash
 ./tadween.sh transcribe "Team sync.m4a"                # writes "Team sync - transcript.txt" next to it
 ./tadween.sh transcribe call.mp4 --speakers 5 --format md
+./tadween.sh transcribe "Sync 1.m4a" "Sync 2.m4a"     # parts of one call, joined in this order
 ./tadween.sh speed-check                               # time Whisper on each engine here; Automatic then uses the fastest
 ```
 

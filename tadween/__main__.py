@@ -21,7 +21,7 @@ def main():
     serve.add_argument("--port", type=int, default=8765)
     serve.add_argument("--no-browser", action="store_true", help="don't open a browser tab")
     one = sub.add_parser("transcribe", help="transcribe one recording and write the transcript next to it")
-    one.add_argument("file")
+    one.add_argument("file", nargs="+", help="the recording; several are parts of one call, joined in this order")
     one.add_argument("--speakers", type=int, help="how many people talk (default: detect)")
     one.add_argument("--format", default="txt", choices=["txt", "md", "srt", "vtt"])
     check = sub.add_parser("speed-check", help="time Whisper on this computer's GPU, CPU or Neural Engine and keep "
@@ -45,11 +45,12 @@ def main():
         return
 
     from . import edits, pipeline, store
-    src = Path(args.file).expanduser()  # the shell leaves a quoted ~ alone
+    srcs = [Path(f).expanduser() for f in args.file]  # the shell leaves a quoted ~ alone
+    src = srcs[0]
     pipeline.on_progress = _print_progress
     pipeline.hold_data_lock()  # so an app started meanwhile leaves this run alone
     try:
-        tid = pipeline.import_file(src, queue_job=False)
+        tid = pipeline.import_file(srcs, queue_job=False)
     except ValueError as e:
         sys.exit(str(e))
     try:

@@ -63,9 +63,11 @@ def check(say=print):
     if not running.acquire(blocking=False):
         raise RuntimeError("A speed check is already running.")
     try:
-        return _check(say)
+        result = _check(say)
     finally:
         running.release()
+    _fetch_small(result, say)  # after the lock: a long download mustn't hold up calls and transcriptions
+    return result
 
 
 def start(say, done):
@@ -81,7 +83,11 @@ def start(say, done):
             result, error = None, e
         finally:
             running.release()
-        done(result, error)
+        try:
+            done(result, error)
+        finally:
+            if result and result["live_model"] == "small":
+                models.fetch_small_in_background()  # Settings shows its progress
 
     threading.Thread(target=work, daemon=True, name="tadween-speed-check").start()
 
@@ -112,19 +118,24 @@ def _check(say):
               "times": {name: round(ms) if ms else None for name, ms in times.items()},
               "errors": {name: error for name, error in errors.items() if error}, "checked": round(time.time())}
     config.write_json(config.SPEED_FILE, result)
-    if result["live_model"] == "small" and not config.SMALL_MODEL.exists():
-        say(f"Downloading the small model for live lines ({models.SMALL_MB} MB)")
-        shown = [0.0]
-
-        def progress(fraction):
-            if fraction - shown[0] >= 0.25:
-                shown[0] = fraction
-                say(f"  {int(fraction * 100)}%")
-        try:
-            models.fetch_small(progress)
-        except Exception as e:  # the timings stand; live lines use the large model until the download works
-            say(f"  The download failed ({type(e).__name__}: {e}). Live lines use the large model until it works.")
     return result
+
+
+def _fetch_small(result, say):
+    """The command line's download of the small model, when the check picked it for live lines."""
+    if result["live_model"] != "small" or config.SMALL_MODEL.exists():
+        return
+    say(f"Downloading the small model for live lines ({models.SMALL_MB} MB)")
+    shown = [0.0]
+
+    def progress(fraction):
+        if fraction - shown[0] >= 0.25:
+            shown[0] = fraction
+            say(f"  {int(fraction * 100)}%")
+    try:
+        models.fetch_small(progress)
+    except Exception as e:  # the timings stand; live lines use the large model until the download works
+        say(f"  The download failed ({type(e).__name__}: {e}). Live lines use the large model until it works.")
 
 
 def seconds(ms):
